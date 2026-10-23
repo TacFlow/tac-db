@@ -2,27 +2,31 @@
 
 **Data:** 24/10/2026 · **Base normativa:** `SPEC.md` 1.3 · **Branch:** `m1-fundacao`
 
-Este documento fixa como o M1 da SPEC será construído: valores, codecs, VFS, locks, páginas G2, alocador, cache, governador e B+tree. Ele não repete a SPEC; cita as seções que governam cada parte e registra as decisões de implementação tomadas no design.
+Este documento fixa como o M1 da SPEC será construído: valores, codecs, VFS, locks, páginas G2, alocador, cache, governador, B+tree e checker estrutural. Ele não repete a SPEC; cita as seções que governam cada parte e registra as decisões de implementação.
 
 ## 1. Decisões já tomadas
 
 | Decisão | Resultado |
 |---|---|
-| Base normativa | SPEC 1.2 do autor, revisada para 1.3 nesta sessão (§32.5 da SPEC, R13-01 a R13-14). |
+| Base normativa | SPEC 1.2 do autor, revisada para 1.3 nesta sessão (§32.5 da SPEC, R13-01 a R13-18). |
 | Primeiro subprojeto | M1 completo mais o mínimo do M0 de que ele depende. O oráculo diferencial e o inventário completo ficam para o M0 completo. |
 | Nome do motor de referência | Nunca aparece no repositório: código, documentação, nomes de arquivos, pacotes ou funções (§2.1). Chamar de “motor de referência” ou “R0”. |
 | Módulo Go | `github.com/TacFlow/tacdb`. O repositório GitHub será renomeado de `tac-db` para `tacdb` pelo autor antes do primeiro push. |
 | Modelo de páginas da B+tree | PageID estável com overlay de cópia na primeira escrita (abordagem A). Shadow paging foi descartado porque exigiria remover o link entre folhas e mudar o WAL por PageID. |
+| Representação no overlay | Cópias privadas **codificadas** de 4096 bytes, editadas no lugar (§4.9). Não há nós decodificados: há um só caminho de leitura, a memória fica limitada a uma página por página suja, e a cópia por época atende ao savepoint O(1) da §10.4 (REV-25). |
 | Toolchain | `go 1.27` com `toolchain go1.27.3`. |
 
 ## 2. Escopo
 
 ### 2.1 Entregáveis de documentação (mínimo do M0)
 
-- `SPEC.md` 1.3: já gerada a partir da 1.2.
-- `FORMAT.md`: o formato G2 do que o M1 implementa (superbloco, cabeçalho de página, slots, prefixo, células folha e interna, overflow em extents, página-descritor, bitmap, página livre, codec de Value, chaves compostas, uvarint). Cresce a cada marco.
-- `COMPATIBILITY.md`: a matriz da §28 com status por linha e as decisões próprias do M1. São duas: a ordem total de valores (§5.3) e a forma canônica obrigatória no codec, com mapas ordenados e uvarint mínimo.
-- `AUDIT-REGRESSIONS.md`: tabela AUD/REV/R13 com status. O M1 fecha REV-14, REV-19, REV-20, REV-21 e REV-42, além de R13-01 a R13-05 e R13-10.
+- `SPEC.md` 1.3, já gerada a partir da 1.2.
+- `FORMAT.md`: o formato G2 do que o M1 implementa, com as formas canônicas da §7 (superbloco e classificação de cópias, cabeçalho, slots, prefixo canônico, células, regra inline, extents e descritor, bitmap com ordem de bits, página livre, codec de Value, chaves compostas, uvarint). Cresce a cada marco.
+- `COMPATIBILITY.md`: a matriz da §28 com status por linha e as decisões próprias do M1 (ordem total de valores; forma canônica obrigatória no codec).
+- `AUDIT-REGRESSIONS.md`: tabela AUD/REV/R13 com status e evidência. O M1 fecha REV-19, REV-20, REV-42, R13-01 a R13-04, R13-10 e R13-15 a R13-18, e deixa com evidência pendente:
+  - REV-14: componente pronto; o GOV-01 depende de transações e fica para o M2;
+  - REV-21: o BT-05 fica parcial, porque o scrub é do M2;
+  - R13-05: BT-02 e check estrutural no M1; o SEC-09 é do M9.
 - `NOTICE`: o aviso de copyright e a licença MIT de R0, sem nomear o projeto, mais a licença BSD-3-Clause de `golang.org/x/sys`.
 - `testdata/golden/`: vetores do codec e imagens de página, comparados byte a byte.
 
@@ -32,32 +36,43 @@ O `THREATMODEL.md` e o inventário de cláusulas e funções ficam para o M0 com
 
 | Pacote | Responsabilidade no M1 | SPEC |
 |---|---|---|
-| raiz `tacdb` + `internal/errs` | `Error`, `Code` e sentinelas; catálogo completo de códigos. | §6.1 |
+| raiz `tacdb` + `internal/errs` | `Error` com `Details`, `Code` e sentinelas; catálogo completo de códigos. | §6.1 |
 | `value` (público) | `Value` imutável com os 9 tipos, construtores que copiam, acessores sem expor memória mutável, `Compare`, `Limits`, `Validate`. | §5 |
 | `internal/codec` | Codec G2 de Value, chaves compostas e uvarint mínimo. | §5.3, §7.1, §7.4 |
-| `internal/vfs` | Interface VFS; implementação de SO confinada em `os.Root`; MemoryVFS com falhas; locks; identidade de arquivo; durabilidade por plataforma. | §8.3, §20.9 |
+| `internal/vfs` | Interface VFS; implementação de SO confinada em `os.Root`; MemoryVFS com falhas; locks; identidade de arquivo; permissões por objeto; durabilidade por plataforma. | §8.3, §20.9 |
 | `internal/govern` | Governador de memória do processo. | §8.5 |
-| `internal/page` | Layout das páginas, CRC32C, verificação estrutural, superbloco. | §7.2, §7.3 |
+| `internal/page` | Layout e formas canônicas das páginas, CRC32C, validação de ponteiros e extents, superbloco, e as interfaces de acesso `Reader`/`Writer`. | §7.1–§7.3 |
 | `internal/alloc` | Alocador por bitmap com extents e limite de 337 extents por valor. | §8.4 |
-| `internal/cache` | Cache CLOCK em shards, pins e uma leitura por página para pedidos simultâneos. | §8.2 |
-| `internal/btree` | B+tree com prefixo, separadores truncados, overflow em extents, cursores e `Verify`. | §8.1 |
+| `internal/cache` | Cache CLOCK em shards, pins por execução e uma leitura por página para pedidos simultâneos. | §8.2 |
+| `internal/btree` | B+tree sobre páginas codificadas: prefixo, separadores truncados, overflow em extents, cursores e `Verify` por árvore. | §8.1 |
+| `internal/check` | Checker estrutural global: todas as raízes, dono único de página, bitmaps, `free_page_count`, extents e formas canônicas. É o “check de páginas” da §27 e a base do `check --structural` da §20.11. | §20.11, §27 |
 
 ### 2.3 Fora do M1
 
-- WAL, transações, diretório de versões, publicação do superbloco, checkpoint e scrub (M2). O scrub fica no M2 porque é parte do checkpoint.
+- WAL, transações, diretório de versões, publicação do superbloco, checkpoint e scrub (M2).
+- O overlay persistente com savepoint O(1) (M2). O M1 define o contrato que a B+tree segue (§4.9).
 - Chaves ordenáveis de propriedades e chave de igualdade/agrupamento (M3/M4).
 - Payload das páginas `fixed` (M8): no M1 só existe a validação de cabeçalho.
 - Oráculo diferencial: M0 completo, no repositório de ferramentas de referência.
 
 ### 2.4 Critério de saída
 
-Os testes abaixo ficam verdes em Linux, macOS e Windows:
-- **Valores:** VAL-01 a VAL-04 no nível de codec e página, com reabertura via arquivo, e VAL-05.
-- **B+tree:** BT-01 a BT-06.
-- **Locks:** OPS-03 (alias por symlink, hard link e outro processo).
-- **Segurança de arquivos:** SEC-08.
-- **Fuzz:** os alvos de §7 rodam sem falhas.
-- **Gates:** os da §25.4 aplicáveis ao M1. O `go build ./cmd/tacdb` entra quando a CLI existir, e o `tacdbvet` no M4.
+Verde em Linux, macOS e Windows:
+
+| Teste | Cobertura no M1 |
+|---|---|
+| VAL-01 | Completo no nível de codec e página, com reabertura por arquivo; refeito via API no M3. |
+| VAL-03 | Round-trip completo; a recusa de valores não finitos em índices é do M3. |
+| VAL-04 | Cópia da entrada; a validade da saída depois de `Close` é do M3. |
+| VAL-05 | Completo. |
+| BT-01, BT-02, BT-03, BT-04, BT-06 | Completos. |
+| BT-05 | Sem scrub (M2). |
+| OPS-03 | Completo: alias por symlink, alias por hard link e outro processo. |
+| SEC-08 | Completo nas três plataformas, sem exceção para o Windows. |
+| `internal/check` | Aprova todas as árvores geradas pelos testes e detecta as mutações de §7.2. |
+| Fuzz | Os alvos de §7.2 rodam sem falhas. |
+
+O VAL-02 (ausência e Null na API e em consultas) é do M3. Os gates aplicáveis da §25.4 também valem; o `go build ./cmd/tacdb` entra com a CLI e o `tacdbvet` no M4.
 
 ## 3. Arquitetura
 
@@ -69,24 +84,28 @@ flowchart TD
   G["internal/govern"] --> E
   F["internal/vfs"] --> E
   P["internal/page"] --> C
-  A["internal/alloc"] --> P
   K["internal/cache"] --> P
   K --> G
+  A["internal/alloc"] --> P
   B["internal/btree"] --> A
-  B --> K
   B --> P
+  H["internal/check"] --> B
+  H --> A
 ```
 
-Todas as dependências apontam para baixo; nenhum pacote do M1 importa `btree`. O `btree` não conhece arquivos: lê e escreve páginas pelas interfaces da §4.9. Quem liga páginas a arquivos é o M2 (WAL e diretório de versões). No M1, essa ligação existe só num armazenamento de teste, descrito na §4.10.
+- **Interfaces em `page`:** `page.Reader` e `page.Writer` ficam em `internal/page`. Assim `alloc` e `btree` dependem de `page` sem ciclo.
+- **Quem implementa:** no M1, o armazenamento de teste (§4.10); no M2, o overlay e o diretório de versões. O cache é usado pelas implementações de `Reader`, não pela B+tree diretamente.
+- **Direção das dependências:** todas apontam para baixo.
 
 ## 4. Componentes
 
 ### 4.1 Erros
 
-`Error{Code, Op, Message, Cause, Retryable, CommitToken?, Location?}`.
+`Error{Code, Op, Message, Cause, Retryable, CommitToken?, Location?, Details}`.
 
+- `Details` é `map[string]int64`, com chaves estáveis por código (§6.1, R13-17). No M1, `RESOURCE_LIMIT` traz `requested`, `available` e `limit`; as durações vão em nanossegundos.
 - Cada código tem uma sentinela `tacdb.ErrX`, e `errors.Is` compara pelo código. `errors.As` dá acesso aos detalhes.
-- O catálogo inteiro da §6.1 vira constantes já no M1, porque é contrato estável.
+- O catálogo inteiro da §6.1 vira constantes já no M1.
 - Os códigos que o M1 produz: `INVALID_ARGUMENT`, `LIMIT_EXCEEDED`, `CORRUPT`, `IO`, `NO_SPACE`, `LOCKED`, `RESOURCE_LIMIT`, `UNSUPPORTED_FORMAT`, `UNSAFE_PATH`, `INSECURE_PERMISSIONS`, `CANCELED` e `DEADLINE`.
 - As mensagens trazem PageID, offset e tamanhos, nunca conteúdo de chave ou valor (§20.12).
 
@@ -94,7 +113,7 @@ Todas as dependências apontam para baixo; nenhum pacote do M1 importa `btree`. 
 
 `Value` é um tipo de valor imutável. O zero value é Null.
 
-- **Construtores:** `Null`, `Bool`, `Int`, `Float`, `String`, `Bytes`, `Vector`, `List`, `MapOf`, `MapFromEntries`. Os que recebem slices copiam a entrada, e o mapa é guardado como entradas ordenadas por bytes da chave.
+- **Construtores:** `Null`, `Bool`, `Int`, `Float`, `String`, `Bytes`, `Vector`, `List`, `MapOf` (a partir de um `map` Go) e `MapFromEntries`. Os que recebem slices copiam a entrada. `MapFromEntries` devolve `INVALID_ARGUMENT` se houver chave duplicada.
 - **Acessores sem cópia mutável:** `Kind`, `Len`, `Index`, `EntryAt`, `AppendBytes`, `VectorAt`. É com eles que o codec trabalha.
 - **Validação:** `Validate(v, Limits)` checa UTF-8, profundidade (64), tamanho codificado (16 MiB), `MaxValueElements` (1 000 000), chaves de mapa (até 64 KiB) e dimensão do Vector (1..65535).
 - **`Compare`:** ordem total da §5.3, nesta sequência de famílias: Bool < número < String < Bytes < Vector < List < Map < Null.
@@ -103,7 +122,7 @@ Todas as dependências apontam para baixo; nenhum pacote do M1 importa `btree`. 
   - Listas, mapas e vetores comparam elemento a elemento e depois pelo comprimento.
   - Strings e bytes comparam por bytes.
 
-  A igualdade de expressão com NaN (sempre falsa) pertence ao executor, no M4.
+  A igualdade de expressão com NaN pertence ao executor, no M4.
 
 ### 4.3 Codec
 
@@ -111,22 +130,29 @@ Todas as dependências apontam para baixo; nenhum pacote do M1 importa `btree`. 
   - Erros com `CORRUPT`: tag desconhecida, Bool fora de 0/1, UTF-8 inválido, chave duplicada ou fora de ordem, dimensão de Vector inválida e bytes sobrando.
   - A forma é canônica: recodificar um valor decodificado devolve exatamente os mesmos bytes.
 - **Chaves compostas:** inteiros big-endian e strings com escape `00 → 00 FF`, terminadas por `00 00`. Inclui o cálculo do fim de faixa para prefix scan e checa o limite de 1024 bytes depois de codificar.
-- **Uvarint:** sempre em forma mínima; forma não mínima é `CORRUPT`.
+- **Uvarint:** sempre em forma mínima; forma não mínima é `CORRUPT`. `uvlen(n)` é a mesma função usada pela regra inline e pelos cálculos de tamanho.
 
 ### 4.4 VFS e locks
 
 **Interface**
 - Operações: abrir e criar exclusivo, `ReadAt` e `WriteAt` completos ou com erro, `Size`, `Truncate`, `Preallocate`, `Sync`, `SyncData`, rename atômico no mesmo diretório, `SyncDir`, `Remove`, listagem e lock.
 - Uma escrita curta vira `IO`; `ENOSPC` vira `NO_SPACE`.
+- As syscalls que o adaptador de plataforma chama direto (locks, `fallocate`, `F_FULLFSYNC`, `F_PREALLOCATE`) repetem em `EINTR`. Um gancho de teste injeta `EINTR` para provar isso.
 
 **Confinamento**
 - O caminho do chamador é resolvido uma vez (`Abs` + `EvalSymlinks` do diretório) e o diretório é aberto como `os.Root`.
 - Antes de abrir, toda entrada passa por `Lstat` via root: symlink dá `UNSAFE_PATH` (R13-03).
 - Nomes passam por `filepath.IsLocal` e por padrões permitidos: `nome.tacdb`, `nome.tacdb.lock`, `nome.tacdb-wal/<16 hex>.wal` e temporários com sufixo de `crypto/rand`.
 
-**Permissões**
-- Arquivos são criados com 0600 e diretórios com 0700. Modo mais amplo, ou dono diferente do usuário efetivo, dá `INSECURE_PERMISSIONS`, salvo `AllowSharedDirectory`.
-- No Windows: DACL restrita ao SID do usuário na criação, e verificação dessa DACL na abertura.
+**Permissões por objeto (§20.9, R13-18)**
+
+| Objeto | Unix | Windows |
+|---|---|---|
+| Arquivos criados pelo tacdb (banco, lock, segmentos, temporários) | 0600, com o usuário efetivo como dono. | DACL protegida com acesso só ao SID do usuário, a SYSTEM e a Administradores. |
+| Diretórios criados pelo tacdb (WAL) | 0700, com o usuário efetivo como dono. | Mesma DACL. |
+| Diretório do chamador | Dono é o usuário efetivo ou root, e não pode haver escrita para grupo ou outros: 0755 passa, 0777 e 1777 não. | Não pode haver ACE de escrita para Everyone, Users ou Authenticated Users. |
+
+Qualquer violação dá `INSECURE_PERMISSIONS`, salvo `AllowSharedDirectory`. O SEC-08 vale nas três plataformas; se o Windows revelar uma limitação real, ela vira uma divergência com ID e teste, nunca um relaxamento silencioso.
 
 **Durabilidade por plataforma**
 
@@ -148,7 +174,7 @@ Os tipos de lock seguem a §8.3: OFD (`F_OFD_SETLK`) no Linux, `flock` no macOS 
 **MemoryVFS**
 - Cada arquivo e cada diretório tem imagem corrente e imagem durável. `Sync` promove o arquivo e `SyncDir` promove os nomes do diretório.
 - `Crash(seed, opções)` volta à imagem durável. Opcionalmente aplica um subconjunto das escritas não sincronizadas em setores de 512 B: completas, parciais (torn) ou fora de ordem.
-- Falhas injetáveis por operação e padrão de caminho: erro, escrita curta, `ENOSPC` depois de N bytes, falha de `Sync`. Tudo é determinístico pela seed.
+- Falhas injetáveis por operação e padrão de caminho: erro, escrita curta, `ENOSPC` depois de N bytes, falha de `Sync` e **truncamento** do arquivo (a cauda volta ao tamanho durável ou a um tamanho escolhido). Tudo é determinístico pela seed.
 - Os locks também existem em memória, com a mesma semântica.
 
 ### 4.5 Governador
@@ -157,169 +183,204 @@ Há um `Governor` por processo, criado na primeira abertura, ou um explícito pa
 
 - Categorias: cache, execução, overlay, selados, transporte e spool, cada uma com fração mínima garantida.
 - `Reserve(ctx, categoria, bytes)` é incremental e devolve uma reserva que se libera no `Close`.
-- Uma reserva que não cabe espera de forma cancelável até `GovernorWait` (1 s) e então devolve `RESOURCE_LIMIT` com `requested`, `available` e `limit`.
+- Uma reserva que não cabe espera de forma cancelável até `GovernorWait` (1 s) e então devolve `RESOURCE_LIMIT` com `requested`, `available` e `limit` em `Details`.
 - Há métricas por categoria.
 - No M1, só o cache e o decode de Values debitam. As demais categorias passam a ser usadas no M2 e no M10.
 
-### 4.6 Páginas
+### 4.6 Páginas e formas canônicas
 
 **Cabeçalho**
 - 48 bytes (§7.3), com CRC32C da página inteira calculado com o campo de CRC zerado.
 - Tipos: free 0, internal 1, leaf 2, overflow 3, bitmap 4, fixed 5.
-- `Verify(buf, id)` roda antes de qualquer exposição da página. Checa:
+- `Verify(buf, id)` roda antes de expor uma página publicada. Checa:
   - CRC, `header_bytes`, tipo conhecido, PageID igual ao esperado e flags permitidas;
   - os campos não usados pelo tipo estão em zero;
   - `lower`/`upper` coerentes e regiões de células dentro dos limites, sem sobreposição;
   - uvarint mínimo;
-  - nenhuma célula inline acima de 1344 bytes.
+  - chaves (prefixo + sufixo) estritamente crescentes;
+  - nenhuma célula inline acima de 1344 bytes;
+  - descritor de extents válido.
 
-  Bytes zerados no espaço livre só são exigidos pela verificação completa (`check`).
+  Bytes zerados no espaço livre e prefixo máximo só são exigidos pela verificação completa (§4.11).
 
 **Página slotted (leaf e internal)**
 - Slots de 4 bytes: `offset:u16` e `length:u16`.
-- Com a flag PREFIX, o slot 0 guarda o prefixo comum e as células guardam só sufixos.
-- A busca binária compara a chave procurada com o prefixo e depois com cada sufixo, sem montar a chave inteira.
+- **Prefixo canônico:** a flag PREFIX fica ligada se e somente se há pelo menos duas chaves e o maior prefixo comum entre a primeira e a última tem pelo menos 1 byte. O slot 0 guarda exatamente esse prefixo e as células guardam só sufixos.
+- Uma cópia privada no overlay pode ter um prefixo menor, porque a finalização normaliza.
+- A busca binária compara a chave procurada com o prefixo e depois com cada sufixo.
 
 **Formato das células**
-- **Folha:** `flags:u8`, `suffix_len:uvarint`, `value_len:uvarint`, sufixo, e então o valor inline ou o descritor. O descritor inline tem `extent_count:u8` de 1 a 4 e pares `start:u64` + `pages:u32`; com o bit 1 ligado, é um `descriptor:u64` que aponta para uma página-descritor.
-- **Interna:** `key_len:uvarint`, `right_child:u64` e o sufixo do separador. O filho à esquerda do primeiro separador fica no `aux`.
-- **Regra inline (R13-01):** o valor fica inline se a célula completa ocupar até 1344 bytes. A célula completa conta `flags`, os dois uvarint, a chave completa sem remoção do prefixo e o valor.
+- **Folha:** `flags:u8`, `suffix_len:uvarint`, `value_len:uvarint`, sufixo, e então o valor inline ou o descritor.
+- **Interna:** `key_len:uvarint` (comprimento do sufixo armazenado), `right_child:u64` e o sufixo do separador. O filho à esquerda do primeiro separador fica no `aux`.
+- **Regra inline (R13-01, R13-15):** o valor fica inline se `1 + uvlen(len(chave)) + uvlen(len(valor)) + len(chave) + len(valor) ≤ 1344`, com a chave completa. A medida não depende do prefixo da página.
 
-**Overflow e descritor**
-- Uma página overflow usa os bytes 48..4095; `count` guarda os bytes úteis.
-- Uma página-descritor é uma página overflow cujo conteúdo é uma lista de pares de 12 bytes, até 337.
+**Extents e descritor**
+- Até 4 extents ficam inline na célula (`extent_count:u8` mais pares `start:u64` + `pages:u32`). De 5 a 337, ficam numa página-descritor (bit 1 da célula e `descriptor:u64`).
+- Forma canônica:
+  - os extents seguem a ordem dos bytes do valor e têm `pages ≥ 1`;
+  - somam exatamente `ceil(value_len/4048)` páginas;
+  - dois extents consecutivos nunca são fisicamente contíguos;
+  - a página-descritor é do tipo overflow, com `count = 12·n`.
+- Uma página overflow usa os bytes 48..4095; `count` guarda os bytes úteis. Todas têm 4048 bytes úteis, exceto a última do valor.
 
 **Bitmap**
 - O grupo g tem seu bitmap na página `2 + g·32385`, com o número do grupo no offset 32 e 32 384 bits de payload.
+- A página de índice `i = PageID − bitmap − 1` corresponde ao bit `i mod 8` do byte `48 + i/8`, contado a partir do bit menos significativo.
+
+**Ponteiros (R13-05)**
+- `page.CheckPointer(id, pageCount)` rejeita como `CORRUPT` o PageID 0 onde o ponteiro é obrigatório, o PageID 1, páginas de bitmap e qualquer PageID ≥ `pageCount`.
+- `page.CheckExtent(e, pageCount)` faz o mesmo para cada página de um extent, o que também rejeita um extent que atravesse um bitmap.
+- A descida da árvore, o alocador e o checker usam essas duas funções.
 
 **Superbloco**
-- Layout da §7.2, com 32 raízes, `free_page_count`, `wal_floor_segment`, raft e `format_revision = 13`.
-- `ChooseSuperblock(a, b)`:
-  - os dois válidos: vence a maior geração;
+- Layout da §7.2, com `format_revision = 13`.
+- `ChooseSuperblock(a, b)` classifica cada cópia isoladamente como estrangeira, danificada, não suportada ou válida, com os critérios da §7.2 1.3:
+  - qualquer cópia não suportada: `UNSUPPORTED_FORMAT`;
+  - duas estrangeiras: `UNSUPPORTED_FORMAT`;
+  - entre as válidas, vence a maior geração;
   - geração igual com conteúdo diferente: `CORRUPT`;
-  - um inválido: usa o outro;
-  - os dois inválidos: `CORRUPT`, sem nunca criar banco por cima;
-  - magic desconhecido, ou `format_revision` diferente de 13: `UNSUPPORTED_FORMAT` (REC-09).
+  - sem nenhuma cópia válida: `CORRUPT`.
 
-**Ponteiros inválidos (R13-05):** PageID 0 como ponteiro obrigatório, PageID 1, uma página de bitmap ou qualquer PageID ≥ `pageCount` encontrado como raiz, filho, irmã ou extent é `CORRUPT`.
-
-### 4.7 Alocador
-
-**Interface**
-- `Alloc(hint)` devolve uma página.
-- `AllocExtents(nPages, hint)` devolve no máximo 337 extents.
-- `Free(id)` e `FreeExtents` liberam.
-- O alocador lê e escreve as páginas de bitmap pelo mesmo `PageSink` da transação, porque o bitmap é uma página versionada (§8.4).
-
-**Política**
-- Escolhe o menor endereço livre, com dica de localidade: o grupo da irmã ou do pai.
-- Extents pedem uma faixa contígua. Se juntar buracos internos exigiria mais de 337 extents, o alocador usa uma faixa na cauda do arquivo, onde só os bitmaps interrompem a faixa (R13-02).
-- O sumário por grupo (páginas livres e maior faixa livre) vive só em memória, como cache: é reconstruído sob demanda e atualizado por deltas.
-- `free_page_count` é mantido pelo alocador e conferido pelo `Verify` do alocador.
-- O primeiro grupo é criado na primeira alocação. O arquivo cresce em blocos de `FileGrowthBytes` (4 MiB).
-
-### 4.8 Cache
-
-- **Chave:** (UUID do banco, PageID, versão); as entradas são imutáveis.
-- **Shards:** CLOCK com segunda chance; o número de shards é a maior potência de 2 ≤ 2×GOMAXPROCS, com mínimo 8.
-- **Miss:** o loader roda fora de qualquer lock e pedidos simultâneos da mesma página esperam essa única leitura. O loader é quem chama `page.Verify`.
-- **Orçamento:** em bytes, incluindo metadados e debitado do governador. Mínimo de 16 páginas por handle.
-- **Evicção e pins:**
-  - a evicção só considera entradas sem pin;
-  - com tudo fixado, devolve `RESOURCE_LIMIT` sem bloquear;
-  - cada execução pode fixar no máximo `MaxPinnedBytesPerExecution` (8 MiB);
-  - um buffer só volta ao pool com contagem de referências zero.
-- **Valores grandes:** valores acima de `LargeValueBypassBytes` (1 MiB) são lidos em buffers da própria execução, sem entrar no cache.
-
-### 4.9 B+tree
-
-**Interfaces**
+### 4.7 Interfaces de acesso a páginas
 
 ```go
-type PageSource interface {
-    Page(id page.ID) (page.Ref, error)            // imagem imutável, verificada, com pin
-    ReadPages(start page.ID, n int, dst []byte) error // leitura sequencial sem cache, para extents
+// em internal/page
+type Ref interface {
+    Bytes() *[Size]byte // imagem imutável enquanto o pin existir
+    Release()
 }
 
-type PageSink interface {
-    PageSource
-    Node(id page.ID) (*Node, error)               // nó mutável do overlay; decodifica na primeira escrita
-    NewNode(kind page.Type, level uint16, hint page.ID) (*Node, error)
-    WriteOverflow(start page.ID, data []byte) error
-    Allocator() alloc.Allocator
-    Generation() uint64                           // muda a cada mutação; invalida cursores de escrita
+type Reader interface { // ligado a uma execução: ctx + orçamento de pins
+    Page(ctx context.Context, id ID) (Ref, error)                  // cópia privada se suja; senão versão publicada verificada
+    ReadOverflow(ctx context.Context, e Extent, dst []byte) error  // payloads verificados (tipo, PageID, CRC, count), em ordem
+    PageCount() uint64
+}
+
+type Writer interface {
+    Reader
+    Writable(ctx context.Context, id ID) (*[Size]byte, error) // cópia privada da época de savepoint corrente
+    Fresh(id ID) (*[Size]byte, error)                         // página recém-alocada, zerada, sem ler conteúdo antigo
+    Discard(id ID)                                            // página liberada: descarta a cópia privada
+    SetPageCount(n uint64)
+    FreePageCount() uint64
+    SetFreePageCount(n uint64)
 }
 ```
 
-**Overlay**
-- O overlay guarda nós decodificados: chaves completas e valores inline ou descritores.
-- A imagem de 4096 bytes de cada nó sujo é codificada uma única vez, quando o overlay é finalizado, e é nesse momento que o prefixo da página é recalculado (§7.3). Isso cumpre o “uma serialização por página suja” e mantém split e merge simples.
-- No M1, a finalização existe no armazenamento de teste; no M2 ela passa a ser feita pelo coordenador de commits.
+**Contratos**
+- **Leitura das próprias escritas:** `Page` devolve a cópia privada de uma página suja, então a B+tree e os cursores leem pelo mesmo caminho. Uma cópia privada não tem CRC até a finalização e não passa por `Verify`.
+- **Época:** um buffer de `Writable` vale até a próxima chamada que possa abrir época nova (savepoint). A B+tree nunca guarda buffers entre operações.
+- **Versão:** a versão de uma página publicada é o CommitID no cabeçalho dela, e é essa versão que entra na chave do cache. O armazenamento de teste atribui CommitIDs monotônicos a cada finalização.
+- **Finalização** (armazenamento de teste no M1; coordenador de commits no M2): cada página suja é normalizada, ou seja, prefixo canônico, células compactadas e espaço livre zerado. Depois recebe o CommitID e o CRC, e só então é emitida, uma vez.
+
+### 4.8 Alocador
+
+**Interface**
+- `Alloc(ctx, hint)` devolve uma página.
+- `AllocExtents(ctx, nPages, hint)` devolve no máximo 337 extents.
+- `Free(ctx, id)` e `FreeExtents` liberam; `Free` também chama `Writer.Discard`.
+
+**Funcionamento**
+- Lê e escreve as páginas de bitmap pelo `page.Writer` da transação, porque o bitmap é versionado como qualquer página.
+- Mantém `pageCount` e `free_page_count` pelo `Writer`.
+- Cria o primeiro grupo na primeira alocação, e cria grupos novos quando a cauda avança. O crescimento físico do arquivo, em blocos de `FileGrowthBytes`, é da camada que grava.
+
+**Política**
+- Escolhe o menor endereço livre, com dica de localidade: o grupo da irmã ou do pai.
+- Extents pedem uma faixa contígua. Se juntar buracos internos exigiria mais de 337 extents, o alocador usa uma faixa na cauda, onde só os bitmaps interrompem a faixa (R13-02).
+- O sumário por grupo vive só em memória, como cache: é reconstruído sob demanda e atualizado por deltas.
+
+### 4.9 B+tree
+
+**Árvores e cursores**
+- Uma árvore de leitura é um par (`page.Reader`, raiz).
+- Uma árvore de escrita (`btree.Tree`) guarda `page.Writer`, alocador, raiz e um **contador de mutações próprio**.
+- Um cursor guarda o contador da sua árvore. Mutar *essa* árvore invalida o cursor, e a próxima operação dele falha com `INVALID_ARGUMENT` e `Op` igual a `cursor`. Mutar outra árvore do mesmo overlay não o afeta (§8.1).
+- Quem cria as árvores (o M2) entrega um único `Tree` por raiz em cada transação.
 
 **Operações**
-- `Get`, `Put`, `Delete`, `SeekGE`, `SeekGT`, `First`, `Next`, `Range` e `Verify`. `Put` e `Delete` devolvem a raiz nova; quem guarda as raízes é o chamador.
+- `Get`, `Put`, `Delete`, `SeekGE`, `SeekGT`, `First`, `Next`, `Range` e `Verify`.
+- `Put` e `Delete` devolvem a raiz nova.
+- Valores devolvidos são sempre cópias do chamador.
 
-**Split**
-- O tamanho de cada lado é calculado relativo ao prefixo atual da página. Isso é um limite superior: o prefixo de cada metade só pode crescer.
-- O ponto escolhido é o mais perto da metade dos bytes em que os dois lados cabem. A regra de 1344 bytes garante que ele existe.
-- O separador é o menor `s` com `max(L) < s ≤ min(R)` (truncamento).
-- Numa folha, a página da direita é nova, o link de irmã é refeito e o separador sobe para o pai.
-- Num nó interno, a chave do meio sobe.
-- Split da raiz cria uma raiz um nível acima.
+**Edição no lugar**
+- Para inserir na página codificada: insere o slot, escreve a célula a partir de `upper` e compacta a página se o espaço só existir fragmentado.
+- Se a chave nova não compartilha o prefixo da página, a página é reescrita com o prefixo novo. Se ainda não couber, faz split.
+- Todas as operações usam uma única função de tamanho, `encodedSize(chaves, valores, prefixo)`, também usada pelo encoder. Um teste de propriedade compara essa função com os bytes realmente codificados.
+
+**Split (R13-16)**
+- **Medida exata:** para cada ponto candidato, o tamanho de cada lado é calculado com o prefixo exato desse lado, isto é, o maior prefixo comum entre a primeira e a última chave dele. Com somas de prefixo dos tamanhos completos, cada candidato custa O(tamanho de chave).
+- **Escolha:** o ponto mais perto da metade em que os dois lados cabem. A regra de 1344 bytes garante que ele existe.
+- **Separador:** em folhas, o menor `s` com `max(L) < s ≤ min(R)`, ou seja, `min(R)[:lcp(max(L), min(R)) + 1]`. Em nós internos, a chave do meio sobe.
+- **Arredores:** o link de irmã é refeito, e o split da raiz cria uma raiz um nível acima.
 
 **Delete**
-- Abaixo de 25% de ocupação, funde com uma irmã do mesmo pai, sempre da direita para dentro da esquerda. Se não couber, redistribui células.
-- Uma raiz interna com um único filho colapsa; árvore vazia tem raiz 0.
+- Abaixo de 25% de ocupação, considera uma irmã do mesmo pai, com a mesma medida exata:
+  - se as duas cabem juntas, funde, sempre a direita dentro da esquerda, e a página da direita é liberada;
+  - se não, redistribui células. Se o separador novo não couber no pai, a redistribuição não é feita e o nó fica abaixo de 25% (§8.1).
+- Uma raiz interna sem separadores colapsa no seu filho; árvore vazia tem raiz 0.
 
 **Overflow**
-- Um valor que não fica inline vai para extents vindos do alocador. Até 4 extents ficam inline na célula; acima disso, numa página-descritor.
-- A substituição grava os extents novos antes de liberar os antigos, os dois no mesmo overlay.
-
-**Cursor**
-- Fica preso a um `PageSource` e uma raiz e avança pelo link de irmã.
-- Um cursor aberto sobre um `PageSink` guarda a geração; depois de qualquer mutação, a próxima operação dele falha com `INVALID_ARGUMENT` e `Op` igual a `cursor`.
-- Valores devolvidos são sempre cópias do chamador.
+- Um valor que não fica inline vai para `AllocExtents`, com as páginas escritas por `Fresh`. O descritor segue a forma canônica de §4.6.
+- A substituição grava os extents novos antes de liberar os antigos.
+- A leitura usa `ReadOverflow`. Acima de `LargeValueBypassBytes`, a implementação lê sem passar pelo cache.
 
 **Defesa**
 - A descida tem limite de 40 níveis, com nível estritamente decrescente.
 - PageID repetido no caminho é `CORRUPT`.
-- `Verify` checa:
-  - ordem, faixas dos separadores e a regra `max(L) < s ≤ min(R)`;
-  - a cadeia de folhas contra a travessia, e os níveis;
-  - extents dentro de `pageCount` e coerentes com `value_len`;
-  - que cada página tem um único dono e que o bitmap marca exatamente as páginas usadas.
+- Todo ponteiro passa por `CheckPointer` ou `CheckExtent`.
+
+**`Verify(árvore)`** checa a estrutura de uma árvore:
+- ordem, faixas e a regra dos separadores;
+- a cadeia de folhas contra a travessia, e os níveis;
+- extents canônicos;
+- formas canônicas.
+
+Devolve as páginas que a árvore possui, para o checker global (§4.11).
 
 ### 4.10 Armazenamento de teste
 
-`internal/btree/btreetest` implementa `PageSource`/`PageSink` em memória, com finalização. Também grava e relê as imagens através de um VFS, sem WAL. Isso habilita os testes de reabertura do M1 e não é usado em produção. No M2, o diretório de versões passa a implementar as mesmas interfaces.
+`internal/btree/btreetest` implementa `page.Reader`/`page.Writer` em memória, com épocas simples e finalização. Também grava e relê as imagens através de um VFS, sem WAL, com um cabeçalho próprio de teste com raízes, `pageCount` e contagem livre. Isso habilita os testes de reabertura do M1 e não é usado em produção. No M2, o overlay persistente e o diretório de versões passam a implementar as mesmas interfaces.
+
+### 4.11 Checker estrutural
+
+`check.Structural(ctx, reader, raízes[32], pageCount, freeCount)` verifica o conjunto inteiro, além do que `btree.Verify` checa por árvore:
+- percorre todas as raízes não nulas e todas as páginas dos bitmaps até `pageCount`;
+- exige que cada página de dados tenha exatamente um dono (uma árvore ou um extent);
+- exige que os bits marquem exatamente as páginas possuídas e que `free_page_count` seja igual às páginas livres cobertas;
+- exige que nenhuma página fora de `pageCount` seja referenciada;
+- checa os bytes zerados e o prefixo máximo (forma canônica).
+
+Devolve um relatório com contagens e o primeiro erro de cada categoria. Os testes do M1 usam o checker depois de cada sequência de operações; o M2 e a CLI (`check --structural`) reutilizam o mesmo pacote.
 
 ## 5. Fluxos
 
 **Leitura (Get)**
-1. Descida a partir da raiz: para cada página, `PageSource.Page`, que é cache hit ou leitura única seguida de `Verify`.
-2. Busca binária no nível da página.
-3. Ao chegar na folha, devolve uma cópia do valor inline. Se o valor estiver em extents, usa `ReadPages`, sem passar pelo cache acima de 1 MiB.
+1. Descida a partir da raiz: para cada página, `Reader.Page` devolve a cópia privada ou a versão publicada, via cache e `Verify`.
+2. Busca binária por prefixo e sufixo.
+3. Na folha, devolve uma cópia do valor inline, ou chama `ReadOverflow` sobre os extents.
 4. Libera os pins.
 
 **Escrita (Put com split)**
-1. Descida registrando o caminho e os nós; `Node(id)` decodifica e copia na primeira escrita.
-2. Inserção. Se a página não cabe, split, com o alocador fornecendo a página nova e atualizando o bitmap.
-3. O separador é propagado para o pai; isso pode se repetir até criar uma raiz nova.
-4. Na finalização, cada nó sujo é codificado uma vez, com CRC.
+1. Descida registrando o caminho; `Writable` obtém cada cópia privada.
+2. Inserção no lugar.
+3. Se não couber: medida exata, split, `Alloc` e `Fresh` da página nova, e propagação do separador, que pode se repetir até criar uma raiz nova.
+4. O contador de mutações da árvore avança.
+5. Na finalização, cada página suja é normalizada, recebe o CRC e é emitida uma vez.
 
 **Valor grande**
 1. `AllocExtents` com faixa contígua.
-2. `WriteOverflow` por extent.
+2. `Fresh` de cada página overflow.
 3. Descritor inline, ou página-descritor quando há mais de 4 extents.
-4. Na leitura, um `ReadPages` sequencial por extent.
+4. Na leitura, um `ReadOverflow` sequencial por extent.
 
 ## 6. Tratamento de erros
 
-- Nenhum caminho de decodificação, página, árvore ou I/O dá panic com entrada corrompida ou forjada; o fuzz verifica isso (§7).
+- Nenhum caminho de decodificação, página, árvore, checker ou I/O dá panic com entrada corrompida ou forjada; o fuzz verifica isso (§7.2).
 - Panic só existe para violação de invariante interna do próprio código, e todo caso conhecido é coberto por teste.
 - `CORRUPT` traz o PageID e o motivo.
 - Erros de I/O preservam a causa (`errors.Unwrap`).
-- Cancelamento só é observado onde há espera (governador e locks), e devolve `CANCELED` ou `DEADLINE`.
+- Cancelamento é observado onde há espera (governador e locks) e entre lotes do checker, e devolve `CANCELED` ou `DEADLINE`.
 
 ## 7. Testes e CI
 
@@ -327,38 +388,46 @@ type PageSink interface {
 
 | Área | Casos |
 |---|---|
-| Valores e codec | Tabelas com todas as tags e limites; casos inválidos da §4.3; VAL-05 (16 MiB de Nulls, chaves grandes, mapas fora de ordem); propriedades de ordem total de `Compare` com valores gerados; casos fixos (Int contra Float em 2^53+1, NaN, `-0`, Null). |
-| Páginas | Codificar e decodificar cada tipo; `Verify` contra mutações; uvarint não mínimo; célula inline de 1345 bytes rejeitada; superbloco e `ChooseSuperblock` em todos os ramos. |
-| Alocador (BT-05) | Alocação e liberação aleatórias com reabertura; preferência pelo menor endereço; limite de 337 extents com fallback para a cauda; `free_page_count` coerente com os bitmaps. |
-| B+tree (BT-01 a BT-04, BT-06) | Sequências com seed (Put, Delete, Get, Seek, Range) contra um mapa ordenado. Chaves de 0 a 1024 bytes com prefixos comuns longos; valores de 0 a 16 MiB, incluindo a fronteira de 1344 bytes e o caso adversarial 2000/2064/2000. `Verify` roda periodicamente e o fanout interno mínimo é medido. |
-| Cache | Pin e unpin, ordem de evicção, `RESOURCE_LIMIT` com tudo fixado, uma leitura para N goroutines, bypass de valores grandes; tudo sob `-race`. |
-| Governador | Reserva, espera, cancelamento, prazo e detalhes do `RESOURCE_LIMIT`. GOV-01 completo fica no M2. |
-| VFS e locks | Segundo handle no mesmo processo, alias por symlink e por hard link, outro processo (o binário de teste se re-executa) e leitores compartilhados. SEC-08: symlink dentro do diretório, `..`, permissões amplas e dono diferente. MemoryVFS: perda de escrita não sincronizada, escrita parcial e rename com e sem `SyncDir`. |
-| Reabertura | Árvore gravada pelo armazenamento de teste via VFS de SO e de memória, reaberta e relida com resultado idêntico. |
-| Goldens | Vetores de Value e imagens de cada tipo de página, comparados byte a byte e regenerados com `-update`. |
+| Valores e codec | Tabelas com todas as tags e limites; casos inválidos da §4.3; VAL-05 (16 MiB de Nulls, chaves grandes, mapas fora de ordem); `MapFromEntries` com duplicata; propriedades de ordem total de `Compare` com valores gerados; casos fixos (Int contra Float em 2^53+1, NaN, `-0`, Null). |
+| Páginas | Codificar e decodificar cada tipo; `Verify` contra mutações; uvarint não mínimo; célula inline acima de 1344 bytes rejeitada; ordem de bits do bitmap; forma canônica do descritor; `CheckPointer` e `CheckExtent`; todos os ramos de `ChooseSuperblock`, incluindo cópias mistas (revisão 14 com geração maior ao lado de revisão 13, estrangeira com válida, danificada com estrangeira). |
+| Tamanho | Propriedade: `encodedSize` igual ao tamanho realmente codificado, para páginas geradas com e sem prefixo. |
+| Alocador (BT-05 parcial) | Alocação e liberação aleatórias com reabertura; preferência pelo menor endereço; limite de 337 extents com fallback para a cauda; extent nunca atravessa bitmap; `free_page_count` coerente com os bitmaps. |
+| B+tree (BT-01 a BT-04, BT-06) | Sequências com seed (Put, Delete, Get, Seek, Range) contra um mapa ordenado. Chaves de 0 a 1024 bytes com prefixos comuns longos; valores de 0 a 16 MiB. Casos dirigidos: a fronteira de 1344 bytes; o caso 2000/2064/2000; uma página cheia de sufixos curtos sob um prefixo de 1000 bytes recebendo uma chave sem esse prefixo; redistribuição que alongaria o separador; cursor invalidado só pela própria árvore. `Verify` e o checker rodam periodicamente, e o fanout interno mínimo é medido. |
+| Checker | Árvores válidas aprovadas; página com dois donos, bit de bitmap errado, `free_page_count` errado, extent fora de `pageCount` e prefixo não máximo detectados. |
+| Cache | Pin e unpin, ordem de evicção, `RESOURCE_LIMIT` com tudo fixado, limite de pins por execução, uma leitura para N goroutines, bypass de valores grandes; tudo sob `-race`. |
+| Governador | Reserva, espera, cancelamento, prazo e `Details` do `RESOURCE_LIMIT`. GOV-01 completo fica no M2. |
+| VFS e locks | Segundo handle no mesmo processo, alias por symlink e por hard link, outro processo (o binário de teste se re-executa) e leitores compartilhados. SEC-08 pela tabela de permissões de §4.4, nas três plataformas. `EINTR` injetado. MemoryVFS: perda de escrita não sincronizada, escrita parcial, truncamento e rename com e sem `SyncDir`. |
+| Reabertura | Árvore gravada pelo armazenamento de teste via VFS de SO e de memória, reaberta, relida com resultado idêntico e aprovada pelo checker. |
+| Goldens | Vetores de Value e imagens de cada tipo de página e do superbloco, comparados byte a byte e regenerados com `-update`. |
 
 ### 7.2 Fuzz
 
-`FuzzValueDecode` exige que um decode bem-sucedido recodifique para os mesmos bytes. Os demais alvos são `FuzzValueRoundTrip`, `FuzzKeyEncoding`, `FuzzUvarint`, `FuzzPageVerify`, `FuzzSuperblock`, `FuzzBitmapExtents` e `FuzzBTreeOps`, este último contra o modelo.
+Os nomes evitam que um alvo seja substring de outro no mesmo pacote. O gate `-fuzz=FuzzValue` da §25.4 aceita uma única correspondência.
 
-Os alvos de página e árvore têm duas variantes: mutação bruta e mutação estrutural com CRC recalculado, para alcançar os validadores que um arquivo forjado alcançaria. O corpus inicial vem dos goldens, e entradas que derem crash ficam em `testdata/fuzz`.
+| Pacote | Alvos |
+|---|---|
+| `internal/codec` | `FuzzValue` (decode; se bem-sucedido, recodifica para os mesmos bytes), `FuzzRoundTrip` (valores gerados), `FuzzKeyEncoding`, `FuzzUvarint`. |
+| `internal/page` | `FuzzPage` (bytes brutos), `FuzzForgedPage` (mutação estrutural com CRC recalculado), `FuzzSuperblock`, `FuzzForgedSuperblock`, `FuzzBitmapExtents`. |
+| `internal/btree` | `FuzzBTreeOps` (contra o modelo, com checker), `FuzzForgedTree` (páginas de uma árvore válida mutadas com CRC recalculado, lidas e verificadas sem panic nem laço). |
+
+O corpus inicial vem dos goldens; entradas que derem crash ficam em `testdata/fuzz`.
 
 ### 7.3 CI (GitHub Actions)
 
 - **Linux, macOS e Windows:** `CGO_ENABLED=0 go test ./...`, `CGO_ENABLED=0 go build ./...`, `go vet ./...` e checagem de gofmt.
 - **Race:** `CGO_ENABLED=1 go test -race ./...` em Linux e macOS.
-- **Fuzz curto:** 60 s por alvo no Linux.
+- **Fuzz curto:** 60 s por alvo no Linux, incluindo o gate literal `go test ./internal/codec -fuzz=FuzzValue -fuzztime=60s`.
 - **Dependências:** `go mod verify`, `govulncheck ./...` e um script sobre `go list -deps -json` que falha se algum pacote de produção tiver `CgoFiles`.
-- **Nomes (§2.1):** um job de `grep` usa o padrão da variável de repositório `FORBIDDEN_NAMES_REGEX`, que o autor configura no GitHub e que nunca fica em arquivo versionado. Sem a variável, o job falha avisando que ela falta.
+- **Nomes (§2.1):** um job de `grep` usa o padrão da variável de repositório `FORBIDDEN_NAMES_REGEX`, que o autor configura no GitHub e que nunca fica em arquivo versionado. Sem a variável, o job falha avisando que ela falta. O padrão cobre o nome do projeto de referência, não o do autor, que a licença exige no `NOTICE`.
 - **Versão:** o `setup-go` lê `go.mod`.
 
 ## 8. Riscos e pontos em aberto
 
 | Risco | Tratamento |
 |---|---|
-| DACL no Windows (criar restrita e verificar) depende de APIs de segurança de `x/sys/windows`. | Implementar com teste real no runner Windows; se a verificação de DACL não for confiável, o M1 documenta o limite em `SECURITY.md` em vez de anunciar a garantia. |
-| `os.Root` no Windows e operações novas (`Rename` dentro da raiz). | Usar só a API da 1.27; testar rename e listagem no runner. |
+| DACL no Windows (criar protegida, verificar a do diretório do chamador) depende de APIs de segurança de `x/sys/windows`. | Implementar e testar no runner Windows. Uma limitação real vira divergência com ID e teste em `COMPATIBILITY.md`, sem relaxar o SEC-08. |
+| `os.Root` no Windows e operações novas (rename dentro da raiz, `Lstat`). | Usar só a API da 1.27; testar rename, listagem e detecção de symlink e junction no runner. |
 | `F_FULLFSYNC` em diretório no macOS. | Fallback para `fsync`, com métrica e teste. |
-| Codificar o nó no fim pode estourar a página se o cálculo de tamanho divergir do encoder. | Uma única função de tamanho, usada pelo split e pelo encoder, e teste de propriedade que confere tamanho calculado contra bytes codificados. |
+| Reescrever uma página inteira quando a chave nova não compartilha o prefixo custa O(página). | Aceito: é raro e limitado a 4 KiB. Medir nos benchmarks de BT-03. |
 | Precisão do governador (RSS contra contabilidade). | O M1 mede só cache e decode; a medição de RSS do GOV-01 fica no M2. |
 | Renomear o repositório GitHub antes do primeiro push. | Depende do autor; até lá, só commits locais no branch `m1-fundacao`. |
