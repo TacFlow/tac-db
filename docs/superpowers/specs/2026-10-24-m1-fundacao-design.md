@@ -8,7 +8,7 @@ Este documento fixa como o M1 da SPEC será construído: valores, codecs, VFS, l
 
 | Decisão | Resultado |
 |---|---|
-| Base normativa | SPEC 1.2 do autor, revisada para 1.3 nesta sessão (§32.5 da SPEC, R13-01 a R13-18). |
+| Base normativa | SPEC 1.2 do autor, revisada para 1.3 nesta sessão (§32.5 da SPEC, R13-01 a R13-21). |
 | Primeiro subprojeto | M1 completo mais o mínimo do M0 de que ele depende. O oráculo diferencial e o inventário completo ficam para o M0 completo. |
 | Nome do motor de referência | Nunca aparece no repositório: código, documentação, nomes de arquivos, pacotes ou funções (§2.1). Chamar de “motor de referência” ou “R0”. |
 | Módulo Go | `github.com/TacFlow/tacdb`. O repositório GitHub será renomeado de `tac-db` para `tacdb` pelo autor antes do primeiro push. |
@@ -23,7 +23,7 @@ Este documento fixa como o M1 da SPEC será construído: valores, codecs, VFS, l
 - `SPEC.md` 1.3, já gerada a partir da 1.2.
 - `FORMAT.md`: o formato G2 do que o M1 implementa, com as formas canônicas da §7 (superbloco e classificação de cópias, cabeçalho, slots, prefixo canônico, células, regra inline, extents e descritor, bitmap com ordem de bits, página livre, codec de Value, chaves compostas, uvarint). Cresce a cada marco.
 - `COMPATIBILITY.md`: a matriz da §28 com status por linha e as decisões próprias do M1 (ordem total de valores; forma canônica obrigatória no codec).
-- `AUDIT-REGRESSIONS.md`: tabela AUD/REV/R13 com status e evidência. O M1 fecha REV-19, REV-20, REV-42, R13-01 a R13-04, R13-10 e R13-15 a R13-18, e deixa com evidência pendente:
+- `AUDIT-REGRESSIONS.md`: tabela AUD/REV/R13 com status e evidência. O M1 fecha REV-19, REV-20, REV-42, R13-01 a R13-04, R13-10 e R13-15 a R13-21, e deixa com evidência pendente:
   - REV-14: componente pronto; o GOV-01 depende de transações e fica para o M2;
   - REV-21: o BT-05 fica parcial, porque o scrub é do M2;
   - R13-05: BT-02 e check estrutural no M1; o SEC-09 é do M9.
@@ -141,18 +141,24 @@ flowchart TD
 
 **Confinamento**
 - O caminho do chamador é resolvido uma vez (`Abs` + `EvalSymlinks` do diretório) e o diretório é aberto como `os.Root`.
-- Antes de abrir, toda entrada passa por `Lstat` via root: symlink dá `UNSAFE_PATH` (R13-03).
+- Antes de abrir, toda entrada passa por `Lstat` via root. O que não for arquivo regular ou diretório dá `UNSAFE_PATH` (R13-03, R13-21): symlink, junction (que no Windows aparece como `ModeIrregular`), dispositivo, socket.
 - Nomes passam por `filepath.IsLocal` e por padrões permitidos: `nome.tacdb`, `nome.tacdb.lock`, `nome.tacdb-wal/<16 hex>.wal` e temporários com sufixo de `crypto/rand`.
 
 **Permissões por objeto (§20.9, R13-18)**
 
 | Objeto | Unix | Windows |
 |---|---|---|
-| Arquivos criados pelo tacdb (banco, lock, segmentos, temporários) | 0600, com o usuário efetivo como dono. | DACL protegida com acesso só ao SID do usuário, a SYSTEM e a Administradores. |
-| Diretórios criados pelo tacdb (WAL) | 0700, com o usuário efetivo como dono. | Mesma DACL. |
-| Diretório do chamador | Dono é o usuário efetivo ou root, e não pode haver escrita para grupo ou outros: 0755 passa, 0777 e 1777 não. | Não pode haver ACE de escrita para Everyone, Users ou Authenticated Users. |
+| Arquivos criados pelo tacdb (banco, lock, segmentos, temporários) | 0600, com o usuário efetivo como dono. | Dono e DACL protegida restritos ao usuário, a SYSTEM e a Administradores. |
+| Diretórios criados pelo tacdb (WAL) | 0700, com o usuário efetivo como dono. | Mesma regra. |
+| Diretório do chamador | Dono é o usuário efetivo ou root, e não pode haver escrita para grupo ou outros: 0755 passa, 0777 e 1777 não. | Dono é o usuário, SYSTEM ou Administradores, e nenhuma ACE efetiva concede escrita a outro SID. |
 
-Qualquer violação dá `INSECURE_PERMISSIONS`, salvo `AllowSharedDirectory`. O SEC-08 vale nas três plataformas; se o Windows revelar uma limitação real, ela vira uma divergência com ID e teste, nunca um relaxamento silencioso.
+Qualquer violação dá `INSECURE_PERMISSIONS`, salvo `AllowSharedDirectory`.
+
+**ACLs por plataforma (R13-21)**
+- **macOS:** ACLs estendidas entram na mesma regra. Uma entrada allow que conceda escrita, append ou criação e remoção de entradas a um principal que não seja o dono torna o objeto inseguro; entradas deny, como o “everyone deny delete” das pastas do usuário, não contam. As ACLs são lidas por `getattrlist(ATTR_CMN_EXTENDED_SECURITY)` via syscall crua do `x/sys/unix` (`Syscall6`), sem cgo.
+- **Linux:** os bits de modo bastam, porque a máscara das ACLs POSIX limita as entradas nomeadas.
+
+O SEC-08 vale nas três plataformas. Se uma plataforma revelar uma limitação real, ela vira uma divergência com ID e teste, nunca um relaxamento silencioso.
 
 **Durabilidade por plataforma**
 
@@ -201,12 +207,13 @@ Há um `Governor` por processo, criado na primeira abertura, ou um explícito pa
   - nenhuma célula inline acima de 1344 bytes;
   - descritor de extents válido.
 
-  Bytes zerados no espaço livre e prefixo máximo só são exigidos pela verificação completa (§4.11).
+  Bytes zerados no espaço livre e a forma canônica do prefixo só são exigidos pela verificação completa (§4.11).
 
 **Página slotted (leaf e internal)**
 - Slots de 4 bytes: `offset:u16` e `length:u16`.
-- **Prefixo canônico:** a flag PREFIX fica ligada se e somente se há pelo menos duas chaves e o maior prefixo comum entre a primeira e a última tem pelo menos 1 byte. O slot 0 guarda exatamente esse prefixo e as células guardam só sufixos.
-- Uma cópia privada no overlay pode ter um prefixo menor, porque a finalização normaliza.
+- **Prefixo canônico (R13-19):** seja `p` o maior prefixo comum entre a primeira e a última chave. A flag PREFIX fica ligada se e somente se há pelo menos duas chaves, `p ≥ 1` e a codificação com `p` é estritamente menor que a codificação sem prefixo. Ligada, o slot 0 guarda exatamente `p` e as células guardam só sufixos.
+- **Tamanho canônico:** é o tamanho dessa forma, e nunca supera o de nenhuma outra escolha de prefixo. Toda decisão de caber usa o tamanho canônico (§4.9).
+- Uma cópia privada no overlay pode ter outro leiaute, desde que caiba fisicamente no buffer; a finalização sempre normaliza.
 - A busca binária compara a chave procurada com o prefixo e depois com cada sufixo.
 
 **Formato das células**
@@ -234,7 +241,7 @@ Há um `Governor` por processo, criado na primeira abertura, ou um explícito pa
 
 **Superbloco**
 - Layout da §7.2, com `format_revision = 13`.
-- `ChooseSuperblock(a, b)` classifica cada cópia isoladamente como estrangeira, danificada, não suportada ou válida, com os critérios da §7.2 1.3:
+- `ChooseSuperblock(a, b)` classifica cada cópia isoladamente, na ordem da §7.2 1.3 (R13-20): magic, CRC, campos de versão (`format_version`, `format_revision`, `min_reader_version`) e, por último, os demais campos. Uma cópia de revisão futura nunca é tomada por danificada. Depois:
   - qualquer cópia não suportada: `UNSUPPORTED_FORMAT`;
   - duas estrangeiras: `UNSUPPORTED_FORMAT`;
   - entre as válidas, vence a maior geração;
@@ -250,9 +257,14 @@ type Ref interface {
     Release()
 }
 
-type Reader interface { // ligado a uma execução: ctx + orçamento de pins
-    Page(ctx context.Context, id ID) (Ref, error)                  // cópia privada se suja; senão versão publicada verificada
-    ReadOverflow(ctx context.Context, e Extent, dst []byte) error  // payloads verificados (tipo, PageID, CRC, count), em ordem
+type Pins interface { // orçamento de pins de uma execução (MaxPinnedBytesPerExecution)
+    Acquire(bytes int) error
+    Release(bytes int)
+}
+
+type Reader interface { // da transação; o orçamento de pins vem de cada execução
+    Page(ctx context.Context, pins Pins, id ID) (Ref, error)                 // cópia privada se suja; senão versão publicada verificada
+    ReadOverflow(ctx context.Context, pins Pins, e Extent, dst []byte) error // payloads verificados (tipo, PageID, CRC, count), em ordem
     PageCount() uint64
 }
 
@@ -269,6 +281,8 @@ type Writer interface {
 
 **Contratos**
 - **Leitura das próprias escritas:** `Page` devolve a cópia privada de uma página suja, então a B+tree e os cursores leem pelo mesmo caminho. Uma cópia privada não tem CRC até a finalização e não passa por `Verify`.
+- **Imutabilidade:** só a `Ref` de uma página publicada é imutável. A `Ref` de uma cópia privada vale até a próxima mutação da mesma transação, e a invalidação de cursores (§4.9) cobre esse caso.
+- **Execução:** `Reader` e `Writer` pertencem à transação. Cada statement cria seu `Pins` e o passa a cada operação, de modo que um único `Tree` por transação atende statements sucessivos.
 - **Época:** um buffer de `Writable` vale até a próxima chamada que possa abrir época nova (savepoint). A B+tree nunca guarda buffers entre operações.
 - **Versão:** a versão de uma página publicada é o CommitID no cabeçalho dela, e é essa versão que entra na chave do cache. O armazenamento de teste atribui CommitIDs monotônicos a cada finalização.
 - **Finalização** (armazenamento de teste no M1; coordenador de commits no M2): cada página suja é normalizada, ou seja, prefixo canônico, células compactadas e espaço livre zerado. Depois recebe o CommitID e o CRC, e só então é emitida, uma vez.
@@ -278,7 +292,7 @@ type Writer interface {
 **Interface**
 - `Alloc(ctx, hint)` devolve uma página.
 - `AllocExtents(ctx, nPages, hint)` devolve no máximo 337 extents.
-- `Free(ctx, id)` e `FreeExtents` liberam; `Free` também chama `Writer.Discard`.
+- `Free(ctx, id)` e `FreeExtents(ctx, extents)` liberam e chamam `Writer.Discard` para cada página liberada.
 
 **Funcionamento**
 - Lê e escreve as páginas de bitmap pelo `page.Writer` da transação, porque o bitmap é versionado como qualquer página.
@@ -297,19 +311,20 @@ type Writer interface {
 - Uma árvore de escrita (`btree.Tree`) guarda `page.Writer`, alocador, raiz e um **contador de mutações próprio**.
 - Um cursor guarda o contador da sua árvore. Mutar *essa* árvore invalida o cursor, e a próxima operação dele falha com `INVALID_ARGUMENT` e `Op` igual a `cursor`. Mutar outra árvore do mesmo overlay não o afeta (§8.1).
 - Quem cria as árvores (o M2) entrega um único `Tree` por raiz em cada transação.
+- As operações recebem `ctx` e o `Pins` da execução corrente.
 
 **Operações**
 - `Get`, `Put`, `Delete`, `SeekGE`, `SeekGT`, `First`, `Next`, `Range` e `Verify`.
 - `Put` e `Delete` devolvem a raiz nova.
 - Valores devolvidos são sempre cópias do chamador.
 
-**Edição no lugar**
-- Para inserir na página codificada: insere o slot, escreve a célula a partir de `upper` e compacta a página se o espaço só existir fragmentado.
-- Se a chave nova não compartilha o prefixo da página, a página é reescrita com o prefixo novo. Se ainda não couber, faz split.
-- Todas as operações usam uma única função de tamanho, `encodedSize(chaves, valores, prefixo)`, também usada pelo encoder. Um teste de propriedade compara essa função com os bytes realmente codificados.
+**Decisão de caber e edição no lugar (R13-19)**
+- **Decisão:** antes de mexer no buffer, calcula o tamanho canônico do conjunto resultante. Se passar de 4048 bytes de conteúdo, faz split; se couber, edita.
+- **Edição:** insere o slot e escreve a célula a partir de `upper`. Se o leiaute atual da cópia não comportar a edição fisicamente (prefixo diferente ou espaço fragmentado), reescreve a cópia na forma canônica e então edita.
+- **Uma função de tamanho:** `encodedSize` calcula o tamanho canônico e é usada por todas as decisões e pelo encoder. Um teste de propriedade compara essa função com os bytes realmente codificados.
 
 **Split (R13-16)**
-- **Medida exata:** para cada ponto candidato, o tamanho de cada lado é calculado com o prefixo exato desse lado, isto é, o maior prefixo comum entre a primeira e a última chave dele. Com somas de prefixo dos tamanhos completos, cada candidato custa O(tamanho de chave).
+- **Medida exata:** para cada ponto candidato, cada lado é medido pelo seu tamanho canônico exato. O prefixo é o maior prefixo comum entre a primeira e a última chave do lado, e os uvarint dos sufixos são recontados, porque `uvlen(len − p)` pode ser menor que `uvlen(len)`. O custo é O(n) por candidato, com n ≤ ~450 células, ou seja, O(n²) por split.
 - **Escolha:** o ponto mais perto da metade em que os dois lados cabem. A regra de 1344 bytes garante que ele existe.
 - **Separador:** em folhas, o menor `s` com `max(L) < s ≤ min(R)`, ou seja, `min(R)[:lcp(max(L), min(R)) + 1]`. Em nós internos, a chave do meio sobe.
 - **Arredores:** o link de irmã é refeito, e o split da raiz cria uma raiz um nível acima.
@@ -340,11 +355,11 @@ Devolve as páginas que a árvore possui, para o checker global (§4.11).
 
 ### 4.10 Armazenamento de teste
 
-`internal/btree/btreetest` implementa `page.Reader`/`page.Writer` em memória, com épocas simples e finalização. Também grava e relê as imagens através de um VFS, sem WAL, com um cabeçalho próprio de teste com raízes, `pageCount` e contagem livre. Isso habilita os testes de reabertura do M1 e não é usado em produção. No M2, o overlay persistente e o diretório de versões passam a implementar as mesmas interfaces.
+`internal/btree/btreetest` implementa `page.Reader`/`page.Writer` em memória, com épocas simples e finalização. Também grava e relê as imagens através de um VFS, sem WAL. As raízes, o `pageCount` e o `free_page_count` vão em superblocos G2 reais nas páginas 0 e 1, alternados a cada gravação com geração crescente, e a reabertura passa por `ChooseSuperblock` e pela validação de raízes. Isso habilita os testes de reabertura do M1 e não é usado em produção. No M2, o overlay persistente e o diretório de versões passam a implementar as mesmas interfaces.
 
 ### 4.11 Checker estrutural
 
-`check.Structural(ctx, reader, raízes[32], pageCount, freeCount)` verifica o conjunto inteiro, além do que `btree.Verify` checa por árvore:
+`check.Structural(ctx, reader, raízes[32], pageCount, freeCount)` verifica o conjunto inteiro, além do que `btree.Verify` checa por árvore. Roda só sobre estado publicado, isto é, um `Reader` sem cópias privadas, nunca sobre um `Writer`.
 - percorre todas as raízes não nulas e todas as páginas dos bitmaps até `pageCount`;
 - exige que cada página de dados tenha exatamente um dono (uma árvore ou um extent);
 - exige que os bits marquem exatamente as páginas possuídas e que `free_page_count` seja igual às páginas livres cobertas;
@@ -389,14 +404,14 @@ Devolve um relatório com contagens e o primeiro erro de cada categoria. Os test
 | Área | Casos |
 |---|---|
 | Valores e codec | Tabelas com todas as tags e limites; casos inválidos da §4.3; VAL-05 (16 MiB de Nulls, chaves grandes, mapas fora de ordem); `MapFromEntries` com duplicata; propriedades de ordem total de `Compare` com valores gerados; casos fixos (Int contra Float em 2^53+1, NaN, `-0`, Null). |
-| Páginas | Codificar e decodificar cada tipo; `Verify` contra mutações; uvarint não mínimo; célula inline acima de 1344 bytes rejeitada; ordem de bits do bitmap; forma canônica do descritor; `CheckPointer` e `CheckExtent`; todos os ramos de `ChooseSuperblock`, incluindo cópias mistas (revisão 14 com geração maior ao lado de revisão 13, estrangeira com válida, danificada com estrangeira). |
-| Tamanho | Propriedade: `encodedSize` igual ao tamanho realmente codificado, para páginas geradas com e sem prefixo. |
+| Páginas | Codificar e decodificar cada tipo; `Verify` contra mutações; uvarint não mínimo; célula inline acima de 1344 bytes rejeitada; ordem de bits do bitmap; forma canônica do descritor; `CheckPointer` e `CheckExtent`; todos os ramos de `ChooseSuperblock`, incluindo cópias mistas (revisão 14 com geração maior ao lado de revisão 13, revisão 14 com raiz 19 ou flag nova, estrangeira com válida, danificada com estrangeira). |
+| Tamanho | Propriedade: `encodedSize` igual ao tamanho realmente codificado e nunca maior que o de qualquer outra escolha de prefixo. Caso dirigido: as chaves "kaaa" a "kddd" com valores de 1000 bytes ficam canônicas sem PREFIX e cabem exatamente. |
 | Alocador (BT-05 parcial) | Alocação e liberação aleatórias com reabertura; preferência pelo menor endereço; limite de 337 extents com fallback para a cauda; extent nunca atravessa bitmap; `free_page_count` coerente com os bitmaps. |
-| B+tree (BT-01 a BT-04, BT-06) | Sequências com seed (Put, Delete, Get, Seek, Range) contra um mapa ordenado. Chaves de 0 a 1024 bytes com prefixos comuns longos; valores de 0 a 16 MiB. Casos dirigidos: a fronteira de 1344 bytes; o caso 2000/2064/2000; uma página cheia de sufixos curtos sob um prefixo de 1000 bytes recebendo uma chave sem esse prefixo; redistribuição que alongaria o separador; cursor invalidado só pela própria árvore. `Verify` e o checker rodam periodicamente, e o fanout interno mínimo é medido. |
+| B+tree (BT-01 a BT-04, BT-06) | Sequências com seed (Put, Delete, Get, Seek, Range) contra um mapa ordenado. Chaves de 0 a 1024 bytes com prefixos comuns longos; valores de 0 a 16 MiB. Casos dirigidos: a fronteira de 1344 bytes; o caso 2000/2064/2000; uma página com 160 sufixos curtos sob um prefixo de 1000 bytes recebendo a chave "b" com valor de 1300 bytes, que precisa encontrar um ponto de split válido pela medida exata; redistribuição que alongaria o separador; cursor invalidado só pela própria árvore. `Verify` e o checker rodam periodicamente, e o fanout interno mínimo é medido. |
 | Checker | Árvores válidas aprovadas; página com dois donos, bit de bitmap errado, `free_page_count` errado, extent fora de `pageCount` e prefixo não máximo detectados. |
 | Cache | Pin e unpin, ordem de evicção, `RESOURCE_LIMIT` com tudo fixado, limite de pins por execução, uma leitura para N goroutines, bypass de valores grandes; tudo sob `-race`. |
 | Governador | Reserva, espera, cancelamento, prazo e `Details` do `RESOURCE_LIMIT`. GOV-01 completo fica no M2. |
-| VFS e locks | Segundo handle no mesmo processo, alias por symlink e por hard link, outro processo (o binário de teste se re-executa) e leitores compartilhados. SEC-08 pela tabela de permissões de §4.4, nas três plataformas. `EINTR` injetado. MemoryVFS: perda de escrita não sincronizada, escrita parcial, truncamento e rename com e sem `SyncDir`. |
+| VFS e locks | Segundo handle no mesmo processo, alias por symlink e por hard link, outro processo (o binário de teste se re-executa) e leitores compartilhados. SEC-08 pela tabela de permissões de §4.4, nas três plataformas, incluindo diretório de outro dono e ACE de escrita para outro SID no Windows, ACL allow de escrita no macOS e junction no Windows. `EINTR` injetado. MemoryVFS: perda de escrita não sincronizada, escrita parcial, truncamento e rename com e sem `SyncDir`. |
 | Reabertura | Árvore gravada pelo armazenamento de teste via VFS de SO e de memória, reaberta, relida com resultado idêntico e aprovada pelo checker. |
 | Goldens | Vetores de Value e imagens de cada tipo de página e do superbloco, comparados byte a byte e regenerados com `-update`. |
 
@@ -428,6 +443,7 @@ O corpus inicial vem dos goldens; entradas que derem crash ficam em `testdata/fu
 | DACL no Windows (criar protegida, verificar a do diretório do chamador) depende de APIs de segurança de `x/sys/windows`. | Implementar e testar no runner Windows. Uma limitação real vira divergência com ID e teste em `COMPATIBILITY.md`, sem relaxar o SEC-08. |
 | `os.Root` no Windows e operações novas (rename dentro da raiz, `Lstat`). | Usar só a API da 1.27; testar rename, listagem e detecção de symlink e junction no runner. |
 | `F_FULLFSYNC` em diretório no macOS. | Fallback para `fsync`, com métrica e teste. |
+| ACLs do macOS dependem de `getattrlist` por syscall crua, sem wrapper no `x/sys/unix`, e do formato `kauth_filesec`. | Testar no runner macOS com ACLs reais (`chmod +a`). Se a syscall crua falhar em alguma versão do sistema, registrar divergência com ID e teste em vez de relaxar o SEC-08. |
 | Reescrever uma página inteira quando a chave nova não compartilha o prefixo custa O(página). | Aceito: é raro e limitado a 4 KiB. Medir nos benchmarks de BT-03. |
 | Precisão do governador (RSS contra contabilidade). | O M1 mede só cache e decode; a medição de RSS do GOV-01 fica no M2. |
 | Renomear o repositório GitHub antes do primeiro push. | Depende do autor; até lá, só commits locais no branch `m1-fundacao`. |
