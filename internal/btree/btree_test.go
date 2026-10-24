@@ -269,6 +269,7 @@ func TestAgainstModel(t *testing.T) {
 						e.commit()
 					}
 					e.check()
+					e.structural()
 				}
 			}
 			for k := range e.model { // empty the tree again

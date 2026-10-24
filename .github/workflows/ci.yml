@@ -71,6 +71,9 @@ jobs:
           for f in FuzzPage FuzzForgedPage FuzzSuperblock FuzzForgedSuperblock FuzzBitmapExtents; do
             go test ./internal/page -run '^$' -fuzz="^${f}\$" -fuzztime=60s
           done
+          for f in FuzzBTreeOps FuzzForgedTree; do
+            go test ./internal/btree -run '^$' -fuzz="^${f}\$" -fuzztime=60s
+          done
 
   deps:
     runs-on: ubuntu-latest
