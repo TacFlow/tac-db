@@ -1,0 +1,13 @@
+# Local working documents, kept out of version control
+/SPEC.md
+/docs/superpowers/
+
+# Binaries and test output
+*.test
+*.out
+/coverage*
+
+# System files
+.DS_Store
+
+# Failing fuzz inputs land in testdata/fuzz and ARE versioned.
