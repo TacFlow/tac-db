@@ -104,7 +104,7 @@ flowchart TD
 `Error{Code, Op, Message, Cause, Retryable, CommitToken?, Location?, Details}`.
 
 - `Details` é `map[string]int64`, com chaves estáveis por código (§6.1, R13-17). No M1, `RESOURCE_LIMIT` traz `requested`, `available` e `limit`; as durações vão em nanossegundos.
-- Cada código tem uma sentinela `tacdb.ErrX`, e `errors.Is` compara pelo código. `errors.As` dá acesso aos detalhes.
+- Cada código tem uma sentinela `tacdb.ErrX`, e `errors.Is` compara pelo código. `errors.As` dá acesso aos detalhes. `With` nunca altera uma sentinela: devolve uma cópia, para que as sentinelas globais sejam imutáveis.
 - O catálogo inteiro da §6.1 vira constantes já no M1.
 - Os códigos que o M1 produz: `INVALID_ARGUMENT`, `LIMIT_EXCEEDED`, `CORRUPT`, `IO`, `NO_SPACE`, `LOCKED`, `RESOURCE_LIMIT`, `UNSUPPORTED_FORMAT`, `UNSAFE_PATH`, `INSECURE_PERMISSIONS`, `CANCELED` e `DEADLINE`.
 - As mensagens trazem PageID, offset e tamanhos, nunca conteúdo de chave ou valor (§20.12).
@@ -115,7 +115,8 @@ flowchart TD
 
 - **Construtores:** `Null`, `Bool`, `Int`, `Float`, `String`, `Bytes`, `Vector`, `List`, `MapOf` (a partir de um `map` Go) e `MapFromEntries`. Os que recebem slices copiam a entrada. `MapFromEntries` devolve `INVALID_ARGUMENT` se houver chave duplicada.
 - **Acessores sem cópia mutável:** `Kind`, `Len`, `Index`, `EntryAt`, `AppendBytes`, `VectorAt`. É com eles que o codec trabalha.
-- **Validação:** `Validate(v, Limits)` checa UTF-8, profundidade (64), tamanho codificado (16 MiB), `MaxValueElements` (1 000 000), chaves de mapa (até 64 KiB) e dimensão do Vector (1..65535).
+- **Validação:** `Validate(v, Limits)` checa UTF-8, profundidade (`MaxDepth`, 64), `MaxValueElements` (1 000 000), chaves de mapa (`MaxMapKeyBytes`, 64 KiB) e dimensão do Vector (`MaxVectorDimensions`, 4096 por padrão, até 65535). O tamanho codificado (`MaxValueBytes`, 16 MiB) é checado pelo codec, dono da codificação, porque `value` não pode importar `codec`. Os nomes dos campos seguem a §24.1.
+- **Comparação:** `Value` não é comparável com `==` (um campo `[0]func()` transforma o uso em erro de compilação, em vez do panic que listas e mapas dariam em runtime); compara-se com `Compare` ou `Identical`.
 - **`Compare`:** ordem total da §5.3, nesta sequência de famílias: Bool < número < String < Bytes < Vector < List < Map < Null.
   - Int e Float são comparados exatamente, sem converter o int64 para float64.
   - NaN fica depois dos números, `-0` empata com `+0` e dois NaN empatam.

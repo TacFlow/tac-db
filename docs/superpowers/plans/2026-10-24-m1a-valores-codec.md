@@ -23,6 +23,7 @@
 | Arquivo | Responsabilidade |
 |---|---|
 | `go.mod` | Módulo `github.com/TacFlow/tacdb`, `go 1.27`, `toolchain go1.27.3`. |
+| `.gitattributes` | LF em todo texto, em qualquer sistema (o checkout do Windows converteria para CRLF). |
 | `doc.go` | Documentação do pacote raiz. |
 | `errors.go` | API pública de erros: aliases `Code`, `Error`, `Location`, as 77 constantes `CodeX` e as sentinelas `ErrX`. |
 | `internal/errs/codes.go` | Os 77 códigos da SPEC §6.1 e `AllCodes`. |
@@ -42,6 +43,7 @@
 
 **Files:**
 - Create: `go.mod`
+- Create: `.gitattributes`
 - Create: `.gitignore`
 - Create: `doc.go`
 - Modify: `README.md` (substitui o conteúdo inteiro)
@@ -58,7 +60,20 @@ go 1.27
 toolchain go1.27.3
 ````
 
-- [ ] **Step 2: Criar o .gitignore**
+- [ ] **Step 2: Criar o .gitattributes**
+
+Criar `.gitattributes` com este conteúdo:
+
+````text
+# Todo texto do repositório usa LF em qualquer sistema; o checkout do
+# Windows converteria para CRLF e quebraria o gofmt e os goldens.
+* text=auto eol=lf
+*.bin binary
+````
+
+Sem ele, o checkout do CI no Windows converte os arquivos para CRLF, e `gofmt -l` e o teste de golden falham.
+
+- [ ] **Step 3: Criar o .gitignore**
 
 Criar `.gitignore` com este conteúdo:
 
@@ -74,7 +89,7 @@ Criar `.gitignore` com este conteúdo:
 # Inputs de fuzz que falharam ficam em testdata/fuzz e SÃO versionados.
 ````
 
-- [ ] **Step 3: Criar o doc.go**
+- [ ] **Step 4: Criar o doc.go**
 
 Criar `doc.go` com este conteúdo:
 
@@ -88,7 +103,7 @@ Criar `doc.go` com este conteúdo:
 package tacdb
 ````
 
-- [ ] **Step 4: Substituir o README.md**
+- [ ] **Step 5: Substituir o README.md**
 
 Substituir o conteúdo de `README.md` com este conteúdo:
 
@@ -119,16 +134,16 @@ go test ./internal/codec -fuzz=FuzzValue -fuzztime=60s
 O código de produção compila com `CGO_ENABLED=0`.
 ````
 
-- [ ] **Step 5: Verificar que o módulo compila**
+- [ ] **Step 6: Verificar que o módulo compila**
 
 Run: `go build ./... && go vet ./... && go version`
 
 Expected: nenhuma saída dos dois primeiros comandos e `go version go1.27.3 ...` (na primeira vez o Go baixa o toolchain e imprime `go: downloading go1.27.3`).
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add go.mod .gitignore doc.go README.md
+git add go.mod .gitattributes .gitignore doc.go README.md
 git commit -m "build: criar o módulo github.com/TacFlow/tacdb"
 ```
 
@@ -205,6 +220,17 @@ func TestErrorStringIncludesSortedDetails(t *testing.T) {
 		"(available=0, limit=1024, requested=4096)"
 	if got := err.Error(); got != want {
 		t.Fatalf("Error() = %q, want %q", got, want)
+	}
+}
+
+func TestWithNeverModifiesASentinel(t *testing.T) {
+	s := Sentinel(CodeLimitExceeded)
+	e := s.With("limit", 1)
+	if s.Details != nil {
+		t.Fatal("With modified the sentinel")
+	}
+	if e == s || e.Details["limit"] != 1 || !errors.Is(e, s) {
+		t.Fatalf("With on a sentinel = %#v", e)
 	}
 }
 
@@ -427,10 +453,15 @@ type Error struct {
 	Retryable   bool
 	CommitToken *[16]byte
 	Location    *Location
-	// Details carries named numeric facts with stable keys per code, such
-	// as "requested", "available" and "limit" for RESOURCE_LIMIT.
-	// Durations are in nanoseconds.
+	// Details carries named numeric facts whose keys are stable per code
+	// (SPEC §6.1). Durations are in nanoseconds. Keys in use:
+	//
+	//	LIMIT_EXCEEDED  limit, plus one of depth, dimensions, bytes, elements
+	//	RESOURCE_LIMIT  requested, available, limit
+	//	NO_SPACE        capacity (in-memory file system only)
 	Details map[string]int64
+
+	sentinel bool
 }
 
 // New returns an error with the given code, operation and message.
@@ -448,13 +479,22 @@ func Wrap(code Code, op string, cause error, msg string) *Error {
 	return &Error{Code: code, Op: op, Message: msg, Cause: cause}
 }
 
-// Sentinel returns a bare error carrying only a code, for use with errors.Is.
+// Sentinel returns a bare error carrying only a code, for use with
+// errors.Is. With never modifies a sentinel.
 func Sentinel(code Code) *Error {
-	return &Error{Code: code}
+	return &Error{Code: code, sentinel: true}
 }
 
-// With sets a detail and returns e, for chaining at construction time.
+// With sets a detail and returns e, for chaining at construction time. On
+// a sentinel it returns a modified copy instead, so that shared sentinels
+// never change.
 func (e *Error) With(key string, v int64) *Error {
+	if e.sentinel {
+		c := *e
+		c.sentinel = false
+		c.Details = nil
+		e = &c
+	}
 	if e.Details == nil {
 		e.Details = make(map[string]int64)
 	}
@@ -1153,7 +1193,11 @@ func (k Kind) String() string {
 }
 
 // Value is an immutable typed value. The zero Value is Null.
+//
+// Values cannot be compared with == or used as map keys; use Compare or
+// Identical.
 type Value struct {
+	_    [0]func() // makes == a compile error instead of a runtime panic
 	kind Kind
 	num  uint64 // Bool (0 or 1), Int (two's complement), Float (IEEE-754 bits)
 	str  string // String and Bytes payload; a string keeps Bytes immutable
@@ -1918,7 +1962,7 @@ func TestValidateRejects(t *testing.T) {
 
 func TestValidateCountsElementsAcrossLevels(t *testing.T) {
 	lim := value.DefaultLimits()
-	lim.MaxElements = 5
+	lim.MaxValueElements = 5
 	inner := value.List(value.Null(), value.Null(), value.Null())  // 3 elements
 	if err := value.Validate(value.List(inner), lim); err != nil { // 1 + 3 = 4
 		t.Fatalf("4 elements rejected: %v", err)
@@ -1936,7 +1980,7 @@ func TestValidateCountsElementsAcrossLevels(t *testing.T) {
 
 func TestLimitsCheck(t *testing.T) {
 	bad := value.DefaultLimits()
-	bad.MaxVectorDims = 70000
+	bad.MaxVectorDimensions = 70000
 	if err := bad.Check(); !errors.Is(err, errs.Sentinel(errs.CodeInvalidArgument)) {
 		t.Fatalf("Check = %v, want INVALID_ARGUMENT", err)
 	}
@@ -1973,21 +2017,21 @@ const (
 
 // Limits bounds the size and shape of a Value (SPEC §5.1, §24.1).
 type Limits struct {
-	MaxDepth        int // nesting depth; a scalar has depth 1
-	MaxEncodedBytes int // size of the G2 encoding
-	MaxElements     int // List items plus Map entries, summed over all levels
-	MaxMapKeyBytes  int // byte length of a key of a Map inside a value
-	MaxVectorDims   int // dimension of a Vector
+	MaxDepth            int // nesting depth; a scalar has depth 1
+	MaxValueBytes       int // size of the G2 encoding
+	MaxValueElements    int // List items plus Map entries, summed over all levels
+	MaxMapKeyBytes      int // byte length of a key of a Map inside a value
+	MaxVectorDimensions int // dimension of a Vector
 }
 
 // DefaultLimits returns the defaults of SPEC §24.1.
 func DefaultLimits() Limits {
 	return Limits{
-		MaxDepth:        64,
-		MaxEncodedBytes: 16 << 20,
-		MaxElements:     1_000_000,
-		MaxMapKeyBytes:  64 << 10,
-		MaxVectorDims:   4096,
+		MaxDepth:            64,
+		MaxValueBytes:       16 << 20,
+		MaxValueElements:    1_000_000,
+		MaxMapKeyBytes:      64 << 10,
+		MaxVectorDimensions: 4096,
 	}
 }
 
@@ -2000,14 +2044,14 @@ func (l Limits) Check() error {
 	switch {
 	case l.MaxDepth < 1 || l.MaxDepth > FormatMaxDepth:
 		return bad("MaxDepth", l.MaxDepth, FormatMaxDepth)
-	case l.MaxEncodedBytes < 1 || l.MaxEncodedBytes > FormatMaxEncodedBytes:
-		return bad("MaxEncodedBytes", l.MaxEncodedBytes, FormatMaxEncodedBytes)
-	case l.MaxElements < 0:
-		return errs.Newf(errs.CodeInvalidArgument, "value.Limits", "MaxElements = %d, want >= 0", l.MaxElements)
+	case l.MaxValueBytes < 1 || l.MaxValueBytes > FormatMaxEncodedBytes:
+		return bad("MaxValueBytes", l.MaxValueBytes, FormatMaxEncodedBytes)
+	case l.MaxValueElements < 0:
+		return errs.Newf(errs.CodeInvalidArgument, "value.Limits", "MaxValueElements = %d, want >= 0", l.MaxValueElements)
 	case l.MaxMapKeyBytes < 1 || l.MaxMapKeyBytes > FormatMaxMapKeyBytes:
 		return bad("MaxMapKeyBytes", l.MaxMapKeyBytes, FormatMaxMapKeyBytes)
-	case l.MaxVectorDims < 1 || l.MaxVectorDims > FormatMaxVectorDims:
-		return bad("MaxVectorDims", l.MaxVectorDims, FormatMaxVectorDims)
+	case l.MaxVectorDimensions < 1 || l.MaxVectorDimensions > FormatMaxVectorDims:
+		return bad("MaxVectorDimensions", l.MaxVectorDimensions, FormatMaxVectorDims)
 	}
 	return nil
 }
@@ -2041,9 +2085,9 @@ func (w *validator) walk(v Value, depth int) error {
 		if n == 0 {
 			return errs.New(errs.CodeInvalidArgument, op, "vector has no components")
 		}
-		if n > w.lim.MaxVectorDims {
+		if n > w.lim.MaxVectorDimensions {
 			return errs.New(errs.CodeLimitExceeded, op, "vector dimension above limit").
-				With("dimensions", int64(n)).With("limit", int64(w.lim.MaxVectorDims))
+				With("dimensions", int64(n)).With("limit", int64(w.lim.MaxVectorDimensions))
 		}
 	case KindList:
 		items := v.ref.([]Value)
@@ -2078,9 +2122,9 @@ func (w *validator) walk(v Value, depth int) error {
 
 func (w *validator) count(n int) error {
 	w.elements += n
-	if w.elements > w.lim.MaxElements {
+	if w.elements > w.lim.MaxValueElements {
 		return errs.New(errs.CodeLimitExceeded, "value.Validate", "too many elements").
-			With("elements", int64(w.elements)).With("limit", int64(w.lim.MaxElements))
+			With("elements", int64(w.elements)).With("limit", int64(w.lim.MaxValueElements))
 	}
 	return nil
 }
@@ -2327,7 +2371,7 @@ func TestAppendValueValidates(t *testing.T) {
 		t.Errorf("invalid UTF-8: err = %v, want INVALID_ARGUMENT", err)
 	}
 	lim := value.DefaultLimits()
-	lim.MaxEncodedBytes = 10
+	lim.MaxValueBytes = 10
 	if _, err := AppendValue(nil, value.String("0123456789"), lim); !errors.Is(err, errs.Sentinel(errs.CodeLimitExceeded)) {
 		t.Errorf("15-byte encoding with limit 10: err = %v, want LIMIT_EXCEEDED", err)
 	}
@@ -2398,7 +2442,7 @@ func (b *countingBudget) Debit(n int64) error {
 }
 
 // VAL-05: 16 MiB of minimal elements is rejected before the element slice
-// is allocated, both by MaxElements and by the budget.
+// is allocated, both by MaxValueElements and by the budget.
 func TestDecodeChargesBeforeAllocating(t *testing.T) {
 	const n = 16<<20 - 5
 	nulls := cat([]byte{0x07}, u32(n), make([]byte, n))
@@ -2408,7 +2452,7 @@ func TestDecodeChargesBeforeAllocating(t *testing.T) {
 	}
 
 	opts := defaultOpts()
-	opts.Limits.MaxElements = math.MaxInt32
+	opts.Limits.MaxValueElements = math.MaxInt32
 	budget := &countingBudget{limit: 1 << 20}
 	opts.Budget = budget
 	var before, after runtime.MemStats
@@ -2499,9 +2543,9 @@ func AppendValue(dst []byte, v value.Value, lim value.Limits) ([]byte, error) {
 		return dst, err
 	}
 	size := EncodedSize(v)
-	if size > int64(lim.MaxEncodedBytes) {
+	if size > int64(lim.MaxValueBytes) {
 		return dst, errs.New(errs.CodeLimitExceeded, "codec.AppendValue", "encoded value too large").
-			With("bytes", size).With("limit", int64(lim.MaxEncodedBytes))
+			With("bytes", size).With("limit", int64(lim.MaxValueBytes))
 	}
 	dst = slices.Grow(dst, int(size))
 	return appendValue(dst, v), nil
@@ -2555,9 +2599,9 @@ func appendValue(dst []byte, v value.Value) []byte {
 // is charged to opt.Budget before it happens. Malformed or non-canonical
 // input is CORRUPT; well-formed input above opt.Limits is LIMIT_EXCEEDED.
 func DecodeValue(b []byte, opt DecodeOptions) (value.Value, error) {
-	if len(b) > opt.Limits.MaxEncodedBytes {
+	if len(b) > opt.Limits.MaxValueBytes {
 		return value.Value{}, errs.New(errs.CodeLimitExceeded, "codec.DecodeValue", "encoded value too large").
-			With("bytes", int64(len(b))).With("limit", int64(opt.Limits.MaxEncodedBytes))
+			With("bytes", int64(len(b))).With("limit", int64(opt.Limits.MaxValueBytes))
 	}
 	d := decoder{b: b, opt: opt}
 	if err := d.charge(elementCost); err != nil {
@@ -2641,9 +2685,9 @@ func (d *decoder) count(n uint32, minBytesEach int) error {
 		return d.corrupt("%d elements cannot fit in the %d remaining bytes", n, d.remaining())
 	}
 	d.elements += int(n)
-	if d.elements > d.opt.Limits.MaxElements {
+	if d.elements > d.opt.Limits.MaxValueElements {
 		return errs.New(errs.CodeLimitExceeded, decodeOp, "too many elements").
-			With("elements", int64(d.elements)).With("limit", int64(d.opt.Limits.MaxElements))
+			With("elements", int64(d.elements)).With("limit", int64(d.opt.Limits.MaxValueElements))
 	}
 	return d.charge(elementCost * int64(n))
 }
@@ -2717,9 +2761,9 @@ func (d *decoder) vector() (value.Value, error) {
 	if n == 0 || n > value.FormatMaxVectorDims {
 		return value.Value{}, d.corrupt("vector dimension %d", n)
 	}
-	if int(n) > d.opt.Limits.MaxVectorDims {
+	if int(n) > d.opt.Limits.MaxVectorDimensions {
 		return value.Value{}, errs.New(errs.CodeLimitExceeded, decodeOp, "vector dimension above limit").
-			With("dimensions", int64(n)).With("limit", int64(d.opt.Limits.MaxVectorDims))
+			With("dimensions", int64(n)).With("limit", int64(d.opt.Limits.MaxVectorDimensions))
 	}
 	raw, err := d.span(4 * n)
 	if err != nil {
@@ -2773,7 +2817,7 @@ func (d *decoder) mapValue(depth int) (value.Value, error) {
 
 Run: `go test ./internal/codec`
 
-Expected: `ok  github.com/TacFlow/tacdb/internal/codec`. O teste `TestDecodeChargesBeforeAllocating` monta 16 MiB e leva cerca de 1 s.
+Expected: `ok  github.com/TacFlow/tacdb/internal/codec`. O teste `TestDecodeChargesBeforeAllocating` monta um buffer de 16 MiB, mas termina rápido: a decodificação falha antes de alocar.
 
 - [ ] **Step 5: Commit**
 
@@ -3282,6 +3326,29 @@ func FuzzUvarint(f *testing.F) {
 	})
 }
 
+// FuzzKeyReader reads arbitrary bytes as key components. It must never
+// panic, and a string it accepts must re-encode to the bytes it consumed.
+func FuzzKeyReader(f *testing.F) {
+	f.Add([]byte{'a', 0x00, 0xff, 0x00, 0x00, 1, 2})
+	f.Add([]byte{0x00, 0x01})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		r := NewKeyReader(data)
+		s, err := r.ReadString()
+		if err == nil {
+			consumed := data[:len(data)-r.Len()]
+			if enc := AppendKeyString(nil, s); !bytes.Equal(enc, consumed) {
+				t.Fatalf("ReadString accepted %x but re-encodes to %x", consumed, enc)
+			}
+		}
+		r = NewKeyReader(data)
+		for r.Len() > 0 {
+			if _, err := r.ReadUint64(); err != nil {
+				break
+			}
+		}
+	})
+}
+
 // FuzzKeyEncoding checks order preservation and round trips of string
 // components.
 func FuzzKeyEncoding(f *testing.F) {
@@ -3342,9 +3409,9 @@ Expected: `ok  github.com/TacFlow/tacdb/internal/codec`.
 
 - [ ] **Step 6: Rodar cada alvo de fuzz por 10 s**
 
-Run: `for f in FuzzValue FuzzRoundTrip FuzzUvarint FuzzKeyEncoding; do go test ./internal/codec -run '^$' -fuzz="^$f\$" -fuzztime=10s || break; done`
+Run: `for f in FuzzValue FuzzRoundTrip FuzzUvarint FuzzKeyEncoding FuzzKeyReader; do go test ./internal/codec -run '^$' -fuzz="^$f\$" -fuzztime=10s || break; done`
 
-Expected: quatro `PASS`. Se um alvo falhar, o Go grava o input em `internal/codec/testdata/fuzz/<alvo>/`; corrija o código, mantenha o arquivo como regressão e rode de novo.
+Expected: cinco `PASS`. Se um alvo falhar, o Go grava o input em `internal/codec/testdata/fuzz/<alvo>/`; corrija o código, mantenha o arquivo como regressão e rode de novo.
 
 - [ ] **Step 7: Rodar o gate literal da SPEC §25.4**
 
@@ -3408,7 +3475,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ````
 
-O bloco da licença MIT precisa ser idêntico ao arquivo de licença do motor de referência; não reformate as linhas.
+O bloco da licença MIT foi conferido byte a byte contra o arquivo de licença do motor de referência quando este plano foi preparado; não reformate as linhas. A licença BSD-3-Clause do `golang.org/x/sys` entra no M1b, junto com a dependência.
 
 - [ ] **Step 2: Criar o FORMAT.md**
 
@@ -3472,10 +3539,10 @@ O decodificador recebe limites (`value.Limits`) e um orçamento opcional (`codec
 | Comprimento ou quantidade maior que os bytes restantes | `CORRUPT`, antes de alocar |
 | Bytes sobrando depois do valor | `CORRUPT` |
 | Profundidade acima de `MaxDepth` (default 64; um escalar tem profundidade 1) | `LIMIT_EXCEEDED` |
-| Elementos de List e Map, somados em todos os níveis, acima de `MaxElements` (default 1 000 000) | `LIMIT_EXCEEDED` |
+| Elementos de List e Map, somados em todos os níveis, acima de `MaxValueElements` (default 1 000 000) | `LIMIT_EXCEEDED` |
 | Chave de Map acima de `MaxMapKeyBytes` (default 64 KiB) | `LIMIT_EXCEEDED` |
-| Dimensão de Vector acima de `MaxVectorDims` (default 4096, máximo 65535) | `LIMIT_EXCEEDED` |
-| Codificação acima de `MaxEncodedBytes` (16 MiB) | `LIMIT_EXCEEDED` |
+| Dimensão de Vector acima de `MaxVectorDimensions` (default 4096, máximo 65535) | `LIMIT_EXCEEDED` |
+| Codificação acima de `MaxValueBytes` (16 MiB) | `LIMIT_EXCEEDED` |
 
 O orçamento é debitado **antes** de cada alocação: 64 bytes por elemento, mais os bytes variáveis de strings, bytes e vetores. Um erro do orçamento interrompe a decodificação e é devolvido como está.
 
@@ -3528,6 +3595,12 @@ Política (SPEC §25.1 e §28): o tacdb busca paridade funcional e semântica co
 | API Go original | Adaptador de conformidade; API principal nova. | Pendente. |
 | C ABI / Python / Java | Fora da distribuição inicial. | Por decisão. |
 | TypeScript | SDK novo por bridge Go. | Pendente (M10, M13). |
+| Melhorias Neo4j | Implementação Go própria dos contratos de §33, em clean room; sem compatibilidade binária, Bolt ou extensão Enterprise. | Pendente (M4 em diante). |
+| Memória/serialize | VFS comum; Serialize produz snapshot G2 consistente sem quiescência. | MemoryVFS no M1b; Serialize pendente (M9). |
+| Embedding helpers/serviços | Excluídos do runtime; vetores externos são aceitos opcionalmente. | Por decisão (ADR-03). |
+| TAC | Linguagem 0.6 e IR 1.3 para o banco; novas construções não são aliases de skill. | Pendente (M7). |
+| Construtos LAYA/SLM e memória antiga implícita | Ausentes do perfil; erro ou migração explícita de fonte. | Pendente (M7). |
+| Performance | Sem promessa de melhoria automática; comparar e registrar; amplificação de escrita tem gate. | Pendente (benchmarks a partir do M2). |
 | Limites G2 | IDs e sequências até MaxInt64; limites fixos exigem nova `format_revision`. | Limites de valor prontos (M1a). |
 
 ## 2. Decisões próprias do tacdb
@@ -3624,7 +3697,7 @@ Cada item das tabelas §32.1, §32.4 e §32.5 da SPEC, com o marco em que precis
 | R13-07 | Payloads de changefeed importados misturavam o formato de R0 com o G2 no mesmo stream | M9 | pendente | — |
 | R13-08 | `result.<nó>` invertia a convenção TAC `<nó>.result`; linhas só posicionais | M7 | pendente | — |
 | R13-09 | WAL órfão de criação interrompida impedia `Open(Create)` | M2 | pendente | — |
-| R13-10 | Go 1.27.2 já substituído por release de correções | M1 | concluído | M1a: `go.mod` com `toolchain go1.27.3`; o CI lê a versão do `go.mod` |
+| R13-10 | Go 1.27.2 já substituído por release de correções | M1 | parcial | M1a: `go.mod` com `toolchain go1.27.3`; vira concluído com o primeiro CI verde |
 | R13-11 | Nomes inconsistentes: métrica de varredura de dicionário com dois nomes; `compatibility.md` | M0 | concluído | SPEC.md 1.3 (§2 e §13.3) |
 | R13-12 | `created_unix_ns` impedia goldens binários byte a byte | M2 | pendente | — |
 | R13-13 | Nome do motor de referência em código e documentação | M0 | parcial | SPEC.md 1.3 §2.1 e job `names` do CI; falta a variável `FORBIDDEN_NAMES_REGEX` no GitHub |
@@ -3752,7 +3825,7 @@ jobs:
         run: go test ./internal/codec -fuzz=FuzzValue -fuzztime=60s
       - name: demais alvos
         run: |
-          for f in FuzzRoundTrip FuzzUvarint FuzzKeyEncoding; do
+          for f in FuzzRoundTrip FuzzUvarint FuzzKeyEncoding FuzzKeyReader; do
             go test ./internal/codec -run '^$' -fuzz="^${f}\$" -fuzztime=60s
           done
 
@@ -3824,15 +3897,15 @@ Run: `CGO_ENABLED=1 go test -race ./...`
 
 Expected: os mesmos `ok`.
 
-- [ ] **Step 4: Nome proibido**
+- [ ] **Step 4: Nome proibido (passo do autor)**
 
-Com a variável definida no shell (o padrão é o mesmo configurado no GitHub):
+Este passo precisa do padrão proibido, que só o autor tem (SPEC §2.1); quem não o tiver pula o passo e avisa o autor. A primeira parte do comando aborta se a variável estiver vazia, porque `git grep -e ""` casaria todas as linhas.
 
-Run: `git grep -n -I -i -E -e "$FORBIDDEN_NAMES_REGEX" -- . ; echo "exit=$?"`
+Run: `: "${FORBIDDEN_NAMES_REGEX:?peça o padrão ao autor}"; git grep -n -I -i -E -e "$FORBIDDEN_NAMES_REGEX" -- . ; echo "exit=$?"`
 
 Expected: nenhuma linha encontrada e `exit=1`.
 
 - [ ] **Step 5: Atualizar a rastreabilidade**
 
-Nada a mudar se as tarefas acima passaram: o `AUDIT-REGRESSIONS.md` da Task 11 já marca R13-10, R13-11 e R13-17 como concluídos e R13-13 como parcial.
+Nada a mudar se as tarefas acima passaram: o `AUDIT-REGRESSIONS.md` da Task 11 marca R13-11 e R13-17 como concluídos, e R13-10 e R13-13 como parciais (o primeiro CI verde e a variável do GitHub os fecham).
 
