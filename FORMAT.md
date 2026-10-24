@@ -2,7 +2,7 @@
 
 This document describes the encodings of the G2 format **as implemented**, with examples that the tests check byte for byte. The normative source is the specification (§5.3, §7 and §9); where the two disagree, the specification wins and the difference is a bug.
 
-The document grows with each milestone. This version covers the value codec, uvarints and composite keys (M1a) and the database files (M1b). The superblock, pages, extents and bitmaps arrive with the `internal/page` package (M1c), and the WAL with M2.
+The document grows with each milestone. This version covers the value codec, uvarints and composite keys (M1a), the database files (M1b), and pages, extents, bitmaps and the superblock (M1c). The WAL arrives with M2.
 
 ## 1. Conventions
 
@@ -98,4 +98,84 @@ Implementation: `internal/vfs`. A database `name.tacdb` lives in one directory a
 Every name goes through `vfs.ValidName`: one or two components separated by `/`, each starting with a letter or digit, made only of letters, digits, `.`, `_` and `-`, not ending with `.`, and not a reserved Windows device name (`CON`, `NUL`, `COM1` and the like). Any other name is `UNSAFE_PATH`.
 
 The database lock has three layers (§8.3, R13-04): the `.lock` file, the main file itself (which catches hard-link aliases, whose `.lock` file is another one) and an in-process registry keyed by file identity. The exclusive lock belongs to the owner; read-only processes share the shared lock while there is no owner.
+
+## 6. Pages
+
+Implementation: `internal/page`. Golden images: `internal/page/testdata/golden/*.bin`. Pages have 4096 bytes; page `N` lives at byte `N*4096` of the main file. Pages 0 and 1 are the two superblock copies; page 2 is the bitmap of the first allocation group.
+
+Every page starts with a 48-byte header:
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 1 | Type: free 0, internal 1, leaf 2, overflow 3, bitmap 4, fixed 5. |
+| 1 | 1 | Flags: bit 0 = PREFIX on slotted pages; zero elsewhere. |
+| 2 | 2 | `header_bytes` = 48. |
+| 4 | 4 | CRC32C (Castagnoli) of the whole page, computed with this field zeroed. |
+| 8 | 8 | The page's own ID. |
+| 16 | 8 | CommitID of this version of the page. |
+| 24 | 2 | Slots of a slotted page (the prefix slot included); useful bytes of an overflow or fixed page; zero otherwise. |
+| 26 | 2 | `lower`: end of the slot array of a slotted page. |
+| 28 | 2 | `upper`: start of the cell area of a slotted page. |
+| 30 | 2 | Level: 0 for a leaf, at least 1 for an internal page. |
+| 32 | 8 | Next leaf (leaf), group number (bitmap) or index ID (fixed). |
+| 40 | 8 | First child (internal). |
+
+Fields a type does not use are zero. A page read from storage goes through `page.Verify` before any other code sees it: CRC, header, the structure of its type and every page reference it holds (against `pageCount`). `page.Canonical` additionally checks the canonical form; the structural check (M1e) uses it.
+
+## 7. Slotted pages (leaf and internal)
+
+Slots of 4 bytes (`offset u16`, `length u16`) follow the header, in key order, so `lower = 48 + 4*slots`. In canonical form, the cells are packed in slot order right after `upper`, and the last one ends at byte 4096; the space between `lower` and `upper` is zero.
+
+**Prefix (R13-19).** Let `p` be the longest common prefix of the first and last full key. The PREFIX flag is set if and only if the page has at least two keys, `p >= 1`, and the encoding with prefix `p` is strictly smaller than the encoding without a prefix. When it is set, slot 0 holds exactly those `p` bytes and every cell stores only the rest of its key. The canonical size of a set of cells is the size of this form, and it is never larger than the size with any other prefix choice. Every fit decision uses it.
+
+**Leaf cell.** `flags u8 | uvarint(suffix length) | uvarint(value length) | key suffix | payload`.
+
+| Flags | Payload |
+|---|---|
+| `0x00` | The value itself (inline). |
+| `0x01` | `extent count u8` (1 to 4), then that many extents of `start u64 + pages u32`. |
+| `0x03` | `descriptor u64`: an overflow page listing 5 to 337 extents. |
+
+**Inline rule (R13-01, R13-15).** A value is inline if and only if `1 + uvlen(len(key)) + uvlen(len(value)) + len(key) + len(value) <= 1344`, with the full key. The measure does not depend on the page prefix. With it, each cell and its slot take at most `(4048 - 4) / 3 = 1348` bytes, so any full page plus one more cell splits into two pages; a leaf holds at least three cells, and the worst out-of-page cell (1024-byte key, four extents) takes 1080 bytes.
+
+**Extents.** A value out of the page needs `ceil(length / 4048)` overflow pages. Up to 4 extents stay inline; 5 to 337 go to a descriptor page; never more. Extents follow the order of the value's bytes, each has at least one page, and two consecutive extents are never physically contiguous (they would be one).
+
+**Internal cell.** `uvarint(separator suffix length) | right child u64 | separator suffix`. The first child is the header's `aux` field. Child 0 holds keys below separator 0; the right child of separator `i` holds keys from separator `i` up to (not including) separator `i+1`.
+
+Example (golden `leaf-prefix.bin`): keys `user/0001` and `user/0002` share the 8-byte prefix `user/000`; with it the page uses 84 bytes, without it 88, so the prefix is used. Slot 0 points to `user/000`, slot 1 to `00 01 05 31 616c696365` (inline, suffix `1`, value `alice`), slot 2 to `00 01 03 32 626f62`.
+
+## 8. Other pages
+
+| Type | Content |
+|---|---|
+| Overflow | Up to 4048 useful bytes from offset 48; `count` gives their number; the rest is zero. Every page of a value holds 4048 bytes except the last. |
+| Descriptor | An overflow page whose useful bytes are 5 to 337 extents of 12 bytes; `count = 12 * n`. |
+| Bitmap | Group `g` has its bitmap at page `2 + g*32385` and covers the 32384 pages after it; the header's offset 32 holds `g`. The page of index `i` in the group (`i = PageID - bitmap - 1`) is bit `i % 8`, counting from the least significant, of byte `48 + i/8`; 1 means allocated. |
+| Free | What the scrub leaves behind: type 0, with `header_bytes`, CRC, page ID and CommitID set and every other byte zero. |
+| Fixed | Vector storage (M8); this milestone checks only the header. |
+
+## 9. Pointers
+
+A page reference is valid only if it is not 0, not 1 (a superblock), not a bitmap page and below `pageCount` (`page.CheckPointer`, R13-05). An extent is valid only if it is not empty, ends at or below `pageCount` and covers no superblock or bitmap page (`page.CheckExtent`).
+
+## 10. Superblock
+
+Pages 0 and 1 hold two copies; a checkpoint writes the copy with the older generation.
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 8 | Magic `TACDBG2\0`. |
+| 8 | 2 | `format_version` = 2. |
+| 10 | 2 | `min_reader_version` = 2. |
+| 12 | 4 | `page_size` = 4096. |
+| 16 | 16 | Database UUID. |
+| 32 | 8×12 | Generation, `checkpoint_lsn`, CommitID, schema epoch, node count, edge count, NodeID high-watermark, EdgeID high-watermark, SymbolID high-watermark, `pageCount`, `wal_floor_segment`, flags (bit 0 = cluster). |
+| 128 | 8×32 | Tree roots; 19 to 31 are reserved and zero. |
+| 384 | 8 | `free_page_count`. |
+| 392 | 8×2 | Applied Raft index and term (zero in standalone). |
+| 408 | 2 | `format_revision` = 13. |
+| 410 | 3682 | Reserved, zero. |
+| 4092 | 4 | CRC32C of bytes 0..4091. |
+
+**Choosing a copy (R13-20).** Each copy is classified in this order: *foreign* if the magic differs; *damaged* if the CRC is wrong; *unsupported* if `format_version` is not 2, `format_revision` is not 13 or `min_reader_version` is above 2; *damaged* if any other field is invalid (page size, unknown flags, non-zero reserved bytes or roots 19..31, `pageCount` below 2 or too large, `free_page_count` above `pageCount`, a root that is not a valid pointer); *valid* otherwise. Then: any unsupported copy, or two foreign copies, make the file `UNSUPPORTED_FORMAT`; between valid copies the higher generation wins, and equal generations with different bytes are `CORRUPT`; with no valid copy the file is `CORRUPT`. Future formats keep the magic, the version fields and the CRC at these offsets so that this reader recognizes them as unsupported.
 

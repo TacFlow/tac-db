@@ -11,7 +11,7 @@ Policy (§25.1 and §28 of the specification): tacdb aims at functional and sema
 | FTS/BM25/fuzzy | Functional parity; deterministic scores across platforms. | Pending (M5). |
 | HNSW | Same capabilities and metrics; topology is not a binary identity. | Pending (M8). |
 | Transactions | One mutating writer; parallel readers; adaptive group commit. | Pending (M2). |
-| Physical maintenance | Passive checkpoint, segmented WAL, bitmap allocator, scrub, compact. | Pending (M1c to M2). |
+| Physical maintenance | Passive checkpoint, segmented WAL, bitmap allocator, scrub, compact. | Page format and superblock ready (M1c); allocator in M1e; WAL and checkpoint in M2. |
 | Cluster/multiprocess | Mandatory in 1.0. | Pending (M10 to M12). |
 | Streams | Sequences, offsets, trim and atomicity preserved. | Pending (M6). |
 | Security | The §20 model, with no counterpart in R0. | File permissions, paths and locks ready (M1b, see SECURITY.md); the rest pending (M10). |
@@ -25,7 +25,7 @@ Policy (§25.1 and §28 of the specification): tacdb aims at functional and sema
 | TAC | Language 0.6 and IR 1.3 for the database; new constructs are not skill aliases. | Pending (M7). |
 | LAYA/SLM constructs and implicit legacy memory | Absent from the profile; an error or an explicit source migration. | Pending (M7). |
 | Performance | No promise of automatic improvement; compare and record; write amplification has a gate. | Pending (benchmarks from M2). |
-| G2 limits | IDs and sequences up to MaxInt64; fixed limits require a new `format_revision`. | Value limits ready (M1a). |
+| G2 limits | IDs and sequences up to MaxInt64; fixed limits require a new `format_revision`. | Value limits (M1a) and page limits (M1c) ready. |
 
 ## 2. tacdb's own decisions
 

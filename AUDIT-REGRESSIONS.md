@@ -36,8 +36,8 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | REV-16 | DDL could not index a large database online | M3 | pending | — |
 | REV-17 | A consumer wrote one WriteTx per skipped event | M7 | pending | — |
 | REV-18 | Metadata and properties in distant regions of the tree | M3 | pending | — |
-| REV-19 | Low fanout with long keys; wide slots | M1 | pending | — |
-| REV-20 | Chained overflow without readahead; large values polluted the cache | M1 | pending | — |
+| REV-19 | Low fanout with long keys; wide slots | M1 | partial | M1c: prefix compression, 4-byte slots and uvarints in `internal/page`; truncated separators and BT-03 in M1e |
+| REV-20 | Chained overflow without readahead; large values polluted the cache | M1 | partial | M1c: extents in the page format; read path and cache bypass in M1d/M1e (BT-04) |
 | REV-21 | A LIFO freelist scattered pages and defeated compact | M1 | pending | — |
 | REV-22 | Long strings lost range and prefix scans in the index | M3 | pending | — |
 | REV-23 | MERGE without an index cost O(N) per call | M3/M7 | pending | — |
@@ -66,11 +66,11 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | REV-46 | Supply chain and bridge without hardening | M13 | pending | — |
 | REV-47 | Fuzzing did not cover protocols, manifests and the catalog | M10–M13 | pending | — |
 | REV-48 | GPL code cited as an implementation reference | M0 | pending | — |
-| R13-01 | A split into two pages was impossible with cells of about 2 KiB (inline values up to 1024 bytes with 1024-byte keys) | M1 | pending | — |
-| R13-02 | A descriptor page holds 337 extents, with no guarantee that a value fits in it | M1 | pending | — |
+| R13-01 | A split into two pages was impossible with cells of about 2 KiB (inline values up to 1024 bytes with 1024-byte keys) | M1 | partial | M1c: inline rule and canonical size in `internal/page` (`TestTwoWaySplitAlwaysExists`, `TestSplitWithForeignKey`); BT-06 in M1e |
+| R13-02 | A descriptor page holds 337 extents, with no guarantee that a value fits in it | M1 | partial | M1c: descriptor limit and `CheckExtents`; the allocator side in M1e |
 | R13-03 | `os.Root` follows symlinks inside the root, contradicting "without following symlinks" | M1 | partial | M1b: `internal/vfs`; verified on Linux and macOS, Windows depends on the CI (SEC-08) |
 | R13-04 | A hard link to the main file escaped the name-based lock | M1 | partial | M1b: `internal/vfs`; verified on Linux and macOS, Windows depends on the CI (OPS-03) |
-| R13-05 | PageID 1, bitmaps and PageIDs ≥ pageCount were not declared invalid as data pointers | M1 | pending | — |
+| R13-05 | PageID 1, bitmaps and PageIDs ≥ pageCount were not declared invalid as data pointers | M1 | partial | M1c: `CheckPointer`, `CheckExtent`, `Verify` and superblock roots; structural check in M1e; SEC-09 in M9 |
 | R13-06 | The changefeed was on by default with no automatic retention and grew without bound | M6 | pending | — |
 | R13-07 | Imported changefeed payloads mixed the R0 format with G2 in the same stream | M9 | pending | — |
 | R13-08 | `result.<node>` inverted the TAC convention `<node>.result`; rows were positional only | M7 | pending | — |
@@ -80,11 +80,11 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | R13-12 | `created_unix_ns` prevented byte-for-byte binary goldens | M2 | pending | — |
 | R13-13 | The reference engine named in code and documentation | M0 | partial | SPEC 1.3 §2.1 and the CI `names` job; needs the `FORBIDDEN_NAMES_REGEX` repository variable |
 | R13-14 | Snowball pt/en "in pure Go" with no defined source | M5 | pending | — |
-| R13-15 | Format ambiguities: the length used by the inline rule, `key_len` of internal cells, when to set PREFIX, bitmap bit order, the canonical descriptor form and mixed superblock copies | M1 | pending | — |
-| R13-16 | Split, merge and redistribution measured with the original page prefix underestimated sizes when the new key does not share it; a longer separator could overflow the parent | M1 | pending | — |
+| R13-15 | Format ambiguities: the length used by the inline rule, `key_len` of internal cells, when to set PREFIX, bitmap bit order, the canonical descriptor form and mixed superblock copies | M1 | done | M1c: definitions in `internal/page`, golden pages, `FuzzPage`, `FuzzSuperblock` |
+| R13-16 | Split, merge and redistribution measured with the original page prefix underestimated sizes when the new key does not share it; a longer separator could overflow the parent | M1 | partial | M1c: canonical size of any cell range; split, merge and redistribution in M1e |
 | R13-17 | `Error` had no field for the numeric details that §6.1 requires | M1 | done | M1a: `internal/errs` (`Error.Details`) and its tests |
 | R13-18 | §20.9 did not say which objects 0600/0700 and the owner check apply to; the caller's directory was ambiguous | M1 | partial | M1b: `internal/vfs`; verified on Linux and macOS, Windows depends on the CI (SEC-08) |
-| R13-19 | The canonical form with a prefix could be larger than the page without one, and fit decisions based on a private copy's layout failed at finalization | M1 | pending | — |
-| R13-20 | A superblock copy from a future revision could be classified as damaged and silently reopen the older copy | M1 | pending | — |
+| R13-19 | The canonical form with a prefix could be larger than the page without one, and fit decisions based on a private copy's layout failed at finalization | M1 | partial | M1c: canonical prefix and size (`TestCanonicalSizeIsMinimal`); B+tree fit decisions in M1e |
+| R13-20 | A superblock copy from a future revision could be classified as damaged and silently reopen the older copy | M1 | done | M1c: `Classify` and `ChooseSuperblock` (`TestClassify`, `TestChooseSuperblock`) |
 | R13-21 | Windows permissions without an owner check, macOS extended ACLs ignored, Windows junctions outside the symlink rule, path-based checks and inheritable ACEs ignored | M1 | partial | M1b: `internal/vfs`; verified on Linux and macOS, Windows depends on the CI (SEC-08) |
 | R13-22 | Write cursors survived a savepoint restore, and a counter restored with the savepoint allowed ABA | M1/M2 | pending | — |
