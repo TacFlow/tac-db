@@ -424,7 +424,7 @@ Os nomes evitam que um alvo seja substring de outro no mesmo pacote. O gate `-fu
 
 | Pacote | Alvos |
 |---|---|
-| `internal/codec` | `FuzzValue` (decode; se bem-sucedido, recodifica para os mesmos bytes), `FuzzRoundTrip` (valores gerados), `FuzzKeyEncoding`, `FuzzUvarint`. |
+| `internal/codec` | `FuzzValue` (decode; se bem-sucedido, recodifica para os mesmos bytes), `FuzzRoundTrip` (valores gerados), `FuzzKeyEncoding`, `FuzzKeyReader` (bytes brutos lidos como componentes de chave), `FuzzUvarint`. |
 | `internal/page` | `FuzzPage` (bytes brutos), `FuzzForgedPage` (mutação estrutural com CRC recalculado), `FuzzSuperblock`, `FuzzForgedSuperblock`, `FuzzBitmapExtents`. |
 | `internal/btree` | `FuzzBTreeOps` (contra o modelo, com checker), `FuzzForgedTree` (páginas de uma árvore válida mutadas com CRC recalculado, lidas e verificadas sem panic nem laço). |
 

@@ -2009,10 +2009,10 @@ import (
 // Maxima fixed by the G2 format (SPEC §31.4). Limits may lower them, never
 // raise them.
 const (
-	FormatMaxDepth        = 64
-	FormatMaxEncodedBytes = 16 << 20
-	FormatMaxMapKeyBytes  = 64 << 10
-	FormatMaxVectorDims   = 65535
+	FormatMaxDepth       = 64
+	FormatMaxValueBytes  = 16 << 20
+	FormatMaxMapKeyBytes = 64 << 10
+	FormatMaxVectorDims  = 65535
 )
 
 // Limits bounds the size and shape of a Value (SPEC §5.1, §24.1).
@@ -2044,8 +2044,8 @@ func (l Limits) Check() error {
 	switch {
 	case l.MaxDepth < 1 || l.MaxDepth > FormatMaxDepth:
 		return bad("MaxDepth", l.MaxDepth, FormatMaxDepth)
-	case l.MaxValueBytes < 1 || l.MaxValueBytes > FormatMaxEncodedBytes:
-		return bad("MaxValueBytes", l.MaxValueBytes, FormatMaxEncodedBytes)
+	case l.MaxValueBytes < 1 || l.MaxValueBytes > FormatMaxValueBytes:
+		return bad("MaxValueBytes", l.MaxValueBytes, FormatMaxValueBytes)
 	case l.MaxValueElements < 0:
 		return errs.Newf(errs.CodeInvalidArgument, "value.Limits", "MaxValueElements = %d, want >= 0", l.MaxValueElements)
 	case l.MaxMapKeyBytes < 1 || l.MaxMapKeyBytes > FormatMaxMapKeyBytes:
