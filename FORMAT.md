@@ -120,7 +120,7 @@ Every page starts with a 48-byte header:
 | 32 | 8 | Next leaf (leaf), group number (bitmap) or index ID (fixed). |
 | 40 | 8 | First child (internal). |
 
-Fields a type does not use are zero. A page read from storage goes through `page.Verify` before any other code sees it: CRC, header, the structure of its type and every page reference it holds (against `pageCount`). `page.Canonical` additionally checks the canonical form; the structural check (M1e) uses it.
+Fields a type does not use are zero. A page read from storage goes through `page.Verify` before any other code sees it: CRC, header, the structure of its type and every page reference it holds (against `pageCount`). `page.Canonical` additionally checks the canonical form; the structural check (§11) uses it.
 
 ## 7. Slotted pages (leaf and internal)
 
@@ -177,5 +177,17 @@ Pages 0 and 1 hold two copies; a checkpoint writes the copy with the older gener
 | 410 | 3682 | Reserved, zero. |
 | 4092 | 4 | CRC32C of bytes 0..4091. |
 
-**Choosing a copy (R13-20).** Each copy is classified in this order: *foreign* if the magic differs; *damaged* if the CRC is wrong; *unsupported* if `format_version` is not 2, `format_revision` is not 13 or `min_reader_version` is above 2; *damaged* if any other field is invalid (page size, unknown flags, non-zero reserved bytes or roots 19..31, `pageCount` below 2 or too large, `free_page_count` above `pageCount`, a root that is not a valid pointer); *valid* otherwise. Then: any unsupported copy, or two foreign copies, make the file `UNSUPPORTED_FORMAT`; between valid copies the higher generation wins, and equal generations with different bytes are `CORRUPT`; with no valid copy the file is `CORRUPT`. Future formats keep the magic, the version fields and the CRC at these offsets so that this reader recognizes them as unsupported.
+**Choosing a copy (R13-20).** Each copy is classified in this order: *foreign* if the magic differs; *damaged* if the CRC is wrong; *unsupported* if `format_version` is not 2, `format_revision` is not 13 or `min_reader_version` is above 2; *damaged* if any other field is invalid (`min_reader_version` below 2, page size, unknown flags, non-zero reserved bytes or roots 19..31, `pageCount` below 2 or too large, `free_page_count` above `pageCount`, a root that is not a valid pointer); *valid* otherwise. Then: any unsupported copy, or two foreign copies, make the file `UNSUPPORTED_FORMAT`; between valid copies the higher generation wins, and equal generations with different bytes are `CORRUPT`; with no valid copy the file is `CORRUPT`. Future formats keep the magic, the version fields and the CRC at these offsets so that this reader recognizes them as unsupported.
 
+## 11. Trees and allocation
+
+Implementation: `internal/btree`, `internal/alloc`, `internal/check`. `btree.Verify` checks one tree and `check.Structural` the whole state; a valid state follows these rules (§8.1, §8.4):
+
+- **Roots.** An empty tree has root 0. A root is a leaf or an internal page with at least one separator; a root with one child collapses into it.
+- **Levels.** A leaf has level 0, and each child of an internal page of level `L` has level `L - 1`. A tree has at most 40 levels.
+- **Keys and separators.** Keys strictly increase within a page. Every key of child `i` lies in `[separator i-1, separator i)`, so each separator `s` between a left subtree `L` and a right subtree `R` satisfies `max(L) < s <= min(R)`.
+- **Leaf chain.** The next-leaf field links the leaves in key order; the last one holds 0.
+- **Ownership.** Every tree page, overflow page and descriptor page belongs to exactly one tree, in one place.
+- **Bitmaps.** A bit is set if and only if its page is owned. Bits of pages at or beyond `pageCount` are zero, and `free_page_count` is the number of clear bits of data pages below `pageCount`.
+
+The placement of pages and the choice of separators are policy, not format: a reader accepts any state that follows the rules above. tacdb splits a leaf with the shortest valid separator, `min(R)[:lcp(max(L), min(R)) + 1]`, and an internal page by moving its middle separator up; merges and redistributions keep the separators valid but not necessarily shortest. tacdb takes a new page from the lowest free address of the group of a related page (a sibling or the parent), then from the lowest free address, then from the end of the file, where reaching the position of the next bitmap page creates that group. A value takes one contiguous free run when there is one; otherwise free runs from the lowest address, completed at the end of the file; and when that would take more than 337 extents, one run at the end of the file, broken only by bitmap pages (R13-02). Freeing a page only clears its bit; `pageCount` does not shrink.
