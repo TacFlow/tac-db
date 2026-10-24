@@ -9,6 +9,7 @@ An embeddable graph database in Go, with full-text search, optional vector searc
 - [FORMAT.md](FORMAT.md): the G2 physical format, as implemented.
 - [COMPATIBILITY.md](COMPATIBILITY.md): the compatibility matrix and tacdb's own decisions.
 - [AUDIT-REGRESSIONS.md](AUDIT-REGRESSIONS.md): traceability of the AUD, REV and R13 items.
+- [SECURITY.md](SECURITY.md): how the security model is implemented, per platform.
 
 Section references such as §7.3 point to the tacdb specification, version 1.3.
 

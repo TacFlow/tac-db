@@ -14,13 +14,13 @@ Policy (§25.1 and §28 of the specification): tacdb aims at functional and sema
 | Physical maintenance | Passive checkpoint, segmented WAL, bitmap allocator, scrub, compact. | Pending (M1c to M2). |
 | Cluster/multiprocess | Mandatory in 1.0. | Pending (M10 to M12). |
 | Streams | Sequences, offsets, trim and atomicity preserved. | Pending (M6). |
-| Security | The §20 model, with no counterpart in R0. | Pending (M1b, M10). |
+| Security | The §20 model, with no counterpart in R0. | File permissions, paths and locks ready (M1b, see SECURITY.md); the rest pending (M10). |
 | R0 main file/WAL | Physically incompatible; migration through LTX1. | By decision (ADR-07). |
 | Original Go API | Conformance adapter; new main API. | Pending. |
 | C ABI / Python / Java | Outside the initial distribution. | By decision. |
 | TypeScript | New SDK over a Go bridge. | Pending (M10, M13). |
 | Neo4j-inspired improvements | tacdb's own Go implementation of the §33 contracts, clean room; no binary compatibility, Bolt or Enterprise extension. | Pending (M4 onwards). |
-| Memory/serialize | Shared VFS; Serialize produces a consistent G2 snapshot without quiescence. | MemoryVFS in M1b; Serialize pending (M9). |
+| Memory/serialize | Shared VFS; Serialize produces a consistent G2 snapshot without quiescence. | MemoryVFS ready (M1b); Serialize pending (M9). |
 | Embedding helpers/services | Excluded from the runtime; external vectors are optionally accepted. | By decision (ADR-03). |
 | TAC | Language 0.6 and IR 1.3 for the database; new constructs are not skill aliases. | Pending (M7). |
 | LAYA/SLM constructs and implicit legacy memory | Absent from the profile; an error or an explicit source migration. | Pending (M7). |

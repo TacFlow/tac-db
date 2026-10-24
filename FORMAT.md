@@ -2,7 +2,7 @@
 
 This document describes the encodings of the G2 format **as implemented**, with examples that the tests check byte for byte. The normative source is the specification (§5.3, §7 and §9); where the two disagree, the specification wins and the difference is a bug.
 
-The document grows with each milestone. This version covers the value codec, uvarints and composite keys (M1a). The superblock, pages, extents and bitmaps arrive with the `internal/page` package (M1c), and the WAL with M2.
+The document grows with each milestone. This version covers the value codec, uvarints and composite keys (M1a) and the database files (M1b). The superblock, pages, extents and bitmaps arrive with the `internal/page` package (M1c), and the WAL with M2.
 
 ## 1. Conventions
 
@@ -83,3 +83,19 @@ Implementation: `internal/codec/key.go`. A B+tree key concatenates components wh
 - String prefix: the escaped form **without** the terminator is a prefix of the key of every string that starts with it, for prefix scans.
 - End of range: `PrefixEnd(p)` returns the smallest key greater than every key that starts with `p` (it increments the last byte other than `0xFF`); it returns nothing when no such key exists.
 - Maximum length of an encoded key: 1024 bytes (`CheckKey`), checked before any mutation.
+
+## 5. Database files
+
+Implementation: `internal/vfs`. A database `name.tacdb` lives in one directory and uses these names (§7.1):
+
+| Name | Content |
+|---|---|
+| `name.tacdb` | Main file. |
+| `name.tacdb.lock` | Lock file: created empty on first open and never removed, so the lock name never changes. |
+| `name.tacdb-wal/` | Directory of the WAL segments (M2), each named `NNNNNNNNNNNNNNNN.wal` with 16 hexadecimal digits. |
+| Temporaries (M2) | Always in the destination directory, with the database prefix and a random `crypto/rand` suffix. |
+
+Every name goes through `vfs.ValidName`: one or two components separated by `/`, each starting with a letter or digit, made only of letters, digits, `.`, `_` and `-`, not ending with `.`, and not a reserved Windows device name (`CON`, `NUL`, `COM1` and the like). Any other name is `UNSAFE_PATH`.
+
+The database lock has three layers (§8.3, R13-04): the `.lock` file, the main file itself (which catches hard-link aliases, whose `.lock` file is another one) and an in-process registry keyed by file identity. The exclusive lock belongs to the owner; read-only processes share the shared lock while there is no owner.
+
