@@ -31,7 +31,7 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | REV-11 | Fuzzy and prefix search without an expansion limit | M5 | pending | — |
 | REV-12 | Ranking with LIMIT scored every match | M5 | pending | — |
 | REV-13 | Vectors in overflow and a seek per distance | M8 | pending | — |
-| REV-14 | No global memory budget | M1 | pending | — |
+| REV-14 | No global memory budget | M1 | partial | M1d: `internal/govern` with floors, shared pool, bounded wait and `RESOURCE_LIMIT` details; the page cache (a quota of 16 pages per handle) and value decoding debit it; GOV-01 in M2 |
 | REV-15 | The single writer held by long operations | M2/M10 | pending | — |
 | REV-16 | DDL could not index a large database online | M3 | pending | — |
 | REV-17 | A consumer wrote one WriteTx per skipped event | M7 | pending | — |
@@ -43,7 +43,7 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | REV-23 | MERGE without an index cost O(N) per call | M3/M7 | pending | — |
 | REV-24 | Plan cache polluted by literals | M4 | pending | — |
 | REV-25 | A per-statement savepoint could copy the overlay | M2 | pending | — |
-| REV-26 | Contention on the RWMutex, the snapshot registry and global LRUs | M2 | pending | — |
+| REV-26 | Contention on the RWMutex, the snapshot registry and global LRUs | M2 | partial | M1d: CLOCK with second chance in shards for the page cache; RWMutex and snapshot registry in M2 |
 | REV-27 | The catalog mixed declarations and hot counters; ambiguous schemaEpoch | M3 | pending | — |
 | REV-28 | A cluster receipt required two fsyncs in series | M11 | pending | — |
 | REV-29 | Bundles of up to 65 MiB went through Raft | M11 | pending | — |

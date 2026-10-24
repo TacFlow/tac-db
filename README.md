@@ -10,6 +10,7 @@ An embeddable graph database in Go, with full-text search, optional vector searc
 - [COMPATIBILITY.md](COMPATIBILITY.md): the compatibility matrix and tacdb's own decisions.
 - [AUDIT-REGRESSIONS.md](AUDIT-REGRESSIONS.md): traceability of the AUD, REV and R13 items.
 - [SECURITY.md](SECURITY.md): how the security model is implemented, per platform.
+- [OPERATIONS.md](OPERATIONS.md): running tacdb in production: memory and durability on macOS.
 
 Section references such as §7.3 point to the tacdb specification, version 1.3.
 
