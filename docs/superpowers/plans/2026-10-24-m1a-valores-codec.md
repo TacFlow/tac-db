@@ -2009,10 +2009,10 @@ import (
 // Maxima fixed by the G2 format (SPEC §31.4). Limits may lower them, never
 // raise them.
 const (
-	FormatMaxDepth       = 64
-	FormatMaxValueBytes  = 16 << 20
-	FormatMaxMapKeyBytes = 64 << 10
-	FormatMaxVectorDims  = 65535
+	FormatMaxDepth            = 64
+	FormatMaxValueBytes       = 16 << 20
+	FormatMaxMapKeyBytes      = 64 << 10
+	FormatMaxVectorDimensions = 65535
 )
 
 // Limits bounds the size and shape of a Value (SPEC §5.1, §24.1).
@@ -2050,8 +2050,8 @@ func (l Limits) Check() error {
 		return errs.Newf(errs.CodeInvalidArgument, "value.Limits", "MaxValueElements = %d, want >= 0", l.MaxValueElements)
 	case l.MaxMapKeyBytes < 1 || l.MaxMapKeyBytes > FormatMaxMapKeyBytes:
 		return bad("MaxMapKeyBytes", l.MaxMapKeyBytes, FormatMaxMapKeyBytes)
-	case l.MaxVectorDimensions < 1 || l.MaxVectorDimensions > FormatMaxVectorDims:
-		return bad("MaxVectorDimensions", l.MaxVectorDimensions, FormatMaxVectorDims)
+	case l.MaxVectorDimensions < 1 || l.MaxVectorDimensions > FormatMaxVectorDimensions:
+		return bad("MaxVectorDimensions", l.MaxVectorDimensions, FormatMaxVectorDimensions)
 	}
 	return nil
 }
@@ -2758,7 +2758,7 @@ func (d *decoder) vector() (value.Value, error) {
 	if err != nil {
 		return value.Value{}, err
 	}
-	if n == 0 || n > value.FormatMaxVectorDims {
+	if n == 0 || n > value.FormatMaxVectorDimensions {
 		return value.Value{}, d.corrupt("vector dimension %d", n)
 	}
 	if int(n) > d.opt.Limits.MaxVectorDimensions {
