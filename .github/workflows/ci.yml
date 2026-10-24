@@ -68,6 +68,9 @@ jobs:
           for f in FuzzRoundTrip FuzzUvarint FuzzKeyEncoding FuzzKeyReader; do
             go test ./internal/codec -run '^$' -fuzz="^${f}\$" -fuzztime=60s
           done
+          for f in FuzzPage FuzzForgedPage FuzzSuperblock FuzzForgedSuperblock FuzzBitmapExtents; do
+            go test ./internal/page -run '^$' -fuzz="^${f}\$" -fuzztime=60s
+          done
 
   deps:
     runs-on: ubuntu-latest
