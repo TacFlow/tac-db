@@ -29,9 +29,40 @@ func unlockFile(f *os.File) error {
 	return retryEINTR(func() error { return unix.Flock(int(f.Fd()), unix.LOCK_UN) })
 }
 
-// syncData uses F_FULLFSYNC through os.File.Sync: plain fsync does not
-// reach the medium on macOS (SPEC §8.3).
-func syncData(f *os.File) error { return f.Sync() }
+// syncData and syncDir use F_FULLFSYNC: plain fsync does not reach the
+// medium on macOS (SPEC §8.3).
+func syncData(f *os.File) error { return fullSync(f) }
+
+func syncDir(d *os.File) error { return fullSync(d) }
+
+// fullFsync issues F_FULLFSYNC; tests replace it to inject failures.
+var fullFsync = func(fd uintptr) error {
+	return retryEINTR(func() error {
+		_, err := unix.FcntlInt(fd, unix.F_FULLFSYNC, 0)
+		return err
+	})
+}
+
+// fullSync flushes f with F_FULLFSYNC. When that fails, as on file systems
+// that do not implement it, it falls back to fsync, whose result decides,
+// and counts the fallback in Stats. It calls fcntl itself because
+// os.File.Sync falls back to fsync silently.
+func fullSync(f *os.File) error {
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return err
+	}
+	var syncErr error
+	if err := rc.Control(func(fd uintptr) {
+		if fullFsync(fd) != nil {
+			fullSyncFallbacks.Add(1)
+			syncErr = retryEINTR(func() error { return unix.Fsync(int(fd)) })
+		}
+	}); err != nil {
+		return err
+	}
+	return syncErr
+}
 
 func preallocate(f *os.File, size int64) {
 	fi, err := f.Stat()
@@ -43,15 +74,6 @@ func preallocate(f *os.File, size int64) {
 		st.Flags = unix.F_ALLOCATEALL
 		retryEINTR(func() error { return unix.FcntlFstore(f.Fd(), unix.F_PREALLOCATE, &st) })
 	}
-}
-
-// syncDir uses F_FULLFSYNC and falls back to fsync when the file system
-// does not support it on directories.
-func syncDir(d *os.File) error {
-	if err := d.Sync(); err != nil {
-		return retryEINTR(func() error { return unix.Fsync(int(d.Fd())) })
-	}
-	return nil
 }
 
 // attrList mirrors struct attrlist of <sys/attr.h>.
