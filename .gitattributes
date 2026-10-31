@@ -1,0 +1,4 @@
+# Every text file uses LF on every system; a Windows checkout would
+# otherwise convert to CRLF and break gofmt and the goldens.
+* text=auto eol=lf
+*.bin binary
