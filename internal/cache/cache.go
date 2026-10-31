@@ -258,10 +258,14 @@ func (c *Cache) fill(ctx context.Context, sh *shard, e *entry, pins page.Pins, l
 	c.loads.Add(1)
 	sh.mu.Lock()
 	e.buf = buf
-	if !c.closed.Load() && sh.m[e.key] == e {
+	cached := !c.closed.Load() && sh.m[e.key] == e
+	if cached {
 		sh.insert(e)
 	}
 	sh.mu.Unlock()
+	if !cached && !c.closed.Load() {
+		c.shrink() // invalidated while loading: the caller keeps the page, the cache does not
+	}
 	done = true
 	close(e.ready)
 	return &Handle{sh: sh, e: e, pins: pins}, nil
@@ -347,7 +351,9 @@ func (sh *shard) evict() *page.Buf {
 			continue
 		}
 		sh.unlink(e)
-		delete(sh.m, e.key)
+		if sh.m[e.key] == e { // an invalidated entry may have a successor
+			delete(sh.m, e.key)
+		}
 		return e.buf
 	}
 	return nil
@@ -367,12 +373,15 @@ func (sh *shard) insert(e *entry) {
 	sh.n++
 }
 
-// unlink takes e, which the hand has passed, out of the list. sh.mu is
-// held.
+// unlink takes e out of the list, moving the hand off it first: Invalidate
+// may unlink the entry the hand is on. sh.mu is held.
 func (sh *shard) unlink(e *entry) {
 	if e.next == e {
 		sh.hand = nil
 	} else {
+		if sh.hand == e {
+			sh.hand = e.next
+		}
 		e.prev.next, e.next.prev = e.next, e.prev
 	}
 	e.prev, e.next = nil, nil
@@ -383,6 +392,28 @@ func (sh *shard) unpin(e *entry) {
 	sh.mu.Lock()
 	e.pins--
 	sh.mu.Unlock()
+}
+
+// Invalidate drops the page of key: later calls to Get load it again.
+// Handles still held keep their buffer. The checkpoint calls it for the
+// pages it rewrites in the main file (design §4.2 of M2).
+func (c *Cache) Invalidate(key Key) {
+	sh := c.shardOf(key)
+	sh.mu.Lock()
+	e, ok := sh.m[key]
+	if !ok {
+		sh.mu.Unlock()
+		return
+	}
+	delete(sh.m, key)
+	free := e.prev != nil && e.pins == 0 // cached and unpinned: its room goes back now
+	if free {
+		sh.unlink(e)
+	}
+	sh.mu.Unlock()
+	if free {
+		c.shrink()
+	}
 }
 
 // Stats is a snapshot of a Cache.
