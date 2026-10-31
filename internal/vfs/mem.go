@@ -22,6 +22,10 @@ type MemFS struct {
 	nextID   uint64
 	root     *memNode
 	faults   []*Fault
+	crashes  []*CrashPoint
+	armed    *CrashPoint // a crash point that fires when the current call returns
+	crashed  int         // crashes so far, Crash and crash points alike
+	dead     bool        // a crash point fired: the process is gone until Restart
 	calls    map[faultKey]int
 	capacity int64 // 0 = unlimited
 	used     int64
@@ -43,6 +47,8 @@ type memNode struct {
 	// files
 	cur, dur []byte
 	pending  []memOp // operations since the last Sync, in order
+	reserved int64   // bytes reserved by Preallocate
+	written  int64   // high-water mark of the bytes written; a Truncate extension is sparse
 	locks    map[*memFile]LockMode
 	// directories
 	curEntries, durEntries map[string]*memNode
@@ -71,15 +77,16 @@ type Op string
 
 // Operations that faults can target.
 const (
-	OpCreate  Op = "create"
-	OpOpen    Op = "open"
-	OpRead    Op = "read"
-	OpWrite   Op = "write"
-	OpSync    Op = "sync"
-	OpSyncDir Op = "syncdir"
-	OpRename  Op = "rename"
-	OpRemove  Op = "remove"
-	OpTrunc   Op = "truncate"
+	OpCreate   Op = "create"
+	OpOpen     Op = "open"
+	OpRead     Op = "read"
+	OpWrite    Op = "write"
+	OpSync     Op = "sync"
+	OpSyncDir  Op = "syncdir"
+	OpRename   Op = "rename"
+	OpRemove   Op = "remove"
+	OpTrunc    Op = "truncate"
+	OpPrealloc Op = "preallocate"
 )
 
 // Fault makes the Nth matching call (1-based; 0 = every call) of Op fail.
@@ -113,20 +120,125 @@ func (m *MemFS) SetCapacity(bytes int64) {
 	m.capacity = bytes
 }
 
+// CrashPoint simulates a power loss at an exact call: the Nth matching
+// call (1-based) of Op on a name matching Name ("" matches any), counted
+// from InjectCrash, before the call takes effect or right after it. The
+// crash then proceeds as Crash with Options; the call itself fails if the
+// crash came before it, and every handle is dead afterwards.
+type CrashPoint struct {
+	Op      Op
+	Name    string
+	Nth     int
+	After   bool
+	Options CrashOptions
+
+	seen int // matching calls since InjectCrash
+}
+
+// InjectCrash adds a crash point; it fires once. Crash points apply to
+// the calls that change state: create, write, sync, syncdir, rename,
+// remove, truncate and preallocate. After a crash point fires, the file
+// system is dead: every call fails as if the process had died, until
+// Restart.
+func (m *MemFS) InjectCrash(p CrashPoint) {
+	switch p.Op {
+	case OpCreate, OpWrite, OpSync, OpSyncDir, OpRename, OpRemove, OpTrunc, OpPrealloc:
+	default:
+		panic("vfs: crash points do not apply to " + string(p.Op))
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.crashes = append(m.crashes, &p)
+}
+
+// Restart brings the file system back after a crash point, as a new
+// process would find it: the durable image, with no open handle.
+func (m *MemFS) Restart() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.dead = false
+}
+
+// begin starts a call that a crash point may target: it counts the call,
+// fails it if the file system is dead, crashes now for a point before the
+// call, and arms a point after it, which fire triggers when the call
+// returns, whatever its result. m.mu is held; the caller defers fire.
+func (m *MemFS) begin(op Op, name string) (*Fault, error) {
+	if m.dead {
+		return nil, powerLost(op, name)
+	}
+	fault, cp := m.enter(op, name)
+	if cp == nil {
+		return fault, nil
+	}
+	if !cp.After {
+		m.crash(cp.Options)
+		m.dead = true
+		return nil, powerLost(op, name)
+	}
+	m.armed = cp
+	return fault, nil
+}
+
+// fire triggers the crash point armed by begin. m.mu is held.
+func (m *MemFS) fire() {
+	if cp := m.armed; cp != nil {
+		m.armed = nil
+		m.crash(cp.Options)
+		m.dead = true
+	}
+}
+
+// alive fails a call when a crash point killed the file system. m.mu is
+// held.
+func (m *MemFS) alive(op string, name string) error {
+	if m.dead {
+		return errs.Newf(errs.CodeIO, "vfs.mem."+op, "%q: simulated power loss", name)
+	}
+	return nil
+}
+
+// Crashes returns how many crashes happened, by Crash or by crash points.
+func (m *MemFS) Crashes() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.crashed
+}
+
 // fault reports the fault that applies to this call, if any. m.mu is held.
 func (m *MemFS) fault(op Op, name string) *Fault {
+	f, _ := m.enter(op, name)
+	return f
+}
+
+// enter counts a call and returns the fault and the crash point that
+// apply to it. A crash point is removed once it fires. m.mu is held.
+func (m *MemFS) enter(op Op, name string) (*Fault, *CrashPoint) {
 	k := faultKey{op, name}
 	m.calls[k]++
 	n := m.calls[k]
+	var fault *Fault
 	for _, f := range m.faults {
-		if f.Op != op || (f.Name != "" && !matchName(f.Name, name)) {
-			continue
-		}
-		if f.Nth == 0 || f.Nth == n {
-			return f
+		if f.Op == op && (f.Name == "" || matchName(f.Name, name)) && (f.Nth == 0 || f.Nth == n) {
+			fault = f
+			break
 		}
 	}
-	return nil
+	for i, p := range m.crashes {
+		if p.Op != op || (p.Name != "" && !matchName(p.Name, name)) {
+			continue
+		}
+		if p.seen++; p.seen == max(p.Nth, 1) {
+			m.crashes = append(m.crashes[:i], m.crashes[i+1:]...)
+			return fault, p
+		}
+	}
+	return fault, nil
+}
+
+// powerLost is the error of a call that a crash point stopped.
+func powerLost(op Op, name string) error {
+	return errs.Newf(errs.CodeIO, "vfs.mem."+string(op), "%q: simulated power loss", name)
 }
 
 func matchName(pattern, name string) bool {
@@ -163,6 +275,10 @@ type CrashOptions struct {
 	// TornWrites applies a random subset of the unsynced writes, each
 	// possibly cut at a 512-byte sector boundary.
 	TornWrites bool
+	// SectorSubset makes each surviving unsynced write keep an arbitrary
+	// subset of its 512-byte sectors, not only a prefix, as a disk that
+	// reorders sector writes would.
+	SectorSubset bool
 	// Reorder applies the surviving unsynced writes in random order.
 	Reorder bool
 	// Truncate cuts the named files, after the crash, to the given size
@@ -177,8 +293,14 @@ type CrashOptions struct {
 func (m *MemFS) Crash(opts CrashOptions) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.crash(opts)
+}
+
+// crash is Crash with m.mu held.
+func (m *MemFS) crash(opts CrashOptions) {
 	r := rand.New(rand.NewPCG(opts.Seed, 1))
 	m.epoch++
+	m.crashed++
 	var walk func(n *memNode)
 	walk = func(n *memNode) {
 		if n.isDir {
@@ -189,7 +311,7 @@ func (m *MemFS) Crash(opts CrashOptions) {
 			return
 		}
 		img := append([]byte(nil), n.dur...)
-		if opts.TornWrites || opts.Reorder {
+		if opts.TornWrites || opts.Reorder || opts.SectorSubset {
 			ops := append([]memOp(nil), n.pending...)
 			if opts.Reorder {
 				r.Shuffle(len(ops), func(i, j int) { ops[i], ops[j] = ops[j], ops[i] })
@@ -198,10 +320,11 @@ func (m *MemFS) Crash(opts CrashOptions) {
 				if opts.TornWrites && r.IntN(2) == 0 {
 					continue
 				}
-				img = applyOp(img, op, opts.TornWrites, r)
+				img = applyOp(img, op, opts, r)
 			}
 		}
 		n.cur, n.dur, n.pending = img, append([]byte(nil), img...), nil
+		n.written = min(n.written, int64(len(img)))
 		n.locks = make(map[*memFile]LockMode)
 	}
 	walk(m.root)
@@ -218,30 +341,44 @@ func (m *MemFS) Crash(opts CrashOptions) {
 			if c.isDir {
 				count(c)
 			} else {
-				m.used += int64(len(c.cur))
+				m.used += c.footprint()
 			}
 		}
 	}
 	count(m.root)
 }
 
-func applyOp(img []byte, op memOp, torn bool, r *rand.Rand) []byte {
+// footprint is the space a file takes: what was written or reserved. A
+// size set by Truncate is sparse, as on the OS file systems, and takes no
+// space until written.
+func (n *memNode) footprint() int64 { return max(n.written, n.reserved) }
+
+func applyOp(img []byte, op memOp, opts CrashOptions, r *rand.Rand) []byte {
 	if op.data == nil {
 		return resize(img, op.truncate)
 	}
-	data := op.data
-	if torn {
-		sectors := (len(data) + 511) / 512
-		keep := r.IntN(sectors + 1)
-		if keep*512 < len(data) {
-			data = data[:keep*512]
+	// The write is cut at absolute 512-byte sector boundaries of the file.
+	type chunk struct{ off, end int64 }
+	var chunks []chunk
+	end := op.off + int64(len(op.data))
+	for pos := op.off; pos < end; {
+		next := min((pos/512+1)*512, end)
+		chunks = append(chunks, chunk{pos, next})
+		pos = next
+	}
+	keep := len(chunks)
+	if opts.TornWrites && !opts.SectorSubset {
+		keep = r.IntN(len(chunks) + 1) // a prefix of the sectors
+	}
+	for k, c := range chunks {
+		if k >= keep || opts.SectorSubset && r.IntN(2) == 0 {
+			continue
 		}
+		if int64(len(img)) < c.end {
+			img = resize(img, c.end)
+		}
+		copy(img[c.off:c.end], op.data[c.off-op.off:c.end-op.off])
 	}
-	end := op.off + int64(len(data))
-	if int64(len(img)) < end {
-		img = resize(img, end)
-	}
-	copy(img[op.off:], data)
 	return img
 }
 
@@ -267,7 +404,12 @@ func (m *MemFS) Create(name string) (File, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.fault(OpCreate, name) != nil {
+	fault, err := m.begin(OpCreate, name)
+	defer m.fire()
+	if err != nil {
+		return nil, err
+	}
+	if fault != nil {
 		return nil, injected(OpCreate, name)
 	}
 	n, dir, leaf, err := m.lookup(name)
@@ -294,6 +436,9 @@ func (m *MemFS) open(name string, readOnly bool) (File, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.alive("open", name); err != nil {
+		return nil, err
+	}
 	if m.fault(OpOpen, name) != nil {
 		return nil, injected(OpOpen, name)
 	}
@@ -324,6 +469,9 @@ func (m *MemFS) Mkdir(name string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.alive("mkdir", name); err != nil {
+		return err
+	}
 	if _, ok := m.root.curEntries[name]; ok {
 		return errs.Newf(errs.CodeDestinationExists, "vfs.mem.mkdir", "%q exists", name)
 	}
@@ -338,7 +486,12 @@ func (m *MemFS) Remove(name string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.fault(OpRemove, name) != nil {
+	fault, err := m.begin(OpRemove, name)
+	defer m.fire()
+	if err != nil {
+		return err
+	}
+	if fault != nil {
 		return injected(OpRemove, name)
 	}
 	n, dir, leaf, err := m.lookup(name)
@@ -352,7 +505,7 @@ func (m *MemFS) Remove(name string) error {
 		return errs.Newf(errs.CodeIO, "vfs.mem.remove", "%q is not empty", name)
 	}
 	if !n.isDir {
-		m.used -= int64(len(n.cur))
+		m.used -= n.footprint()
 	}
 	delete(dir.curEntries, leaf)
 	return nil
@@ -371,7 +524,12 @@ func (m *MemFS) Rename(oldName, newName string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.fault(OpRename, oldName) != nil {
+	fault, err := m.begin(OpRename, oldName)
+	defer m.fire()
+	if err != nil {
+		return err
+	}
+	if fault != nil {
 		return injected(OpRename, oldName)
 	}
 	n, dir, oldLeaf, err := m.lookup(oldName)
@@ -383,7 +541,7 @@ func (m *MemFS) Rename(oldName, newName string) error {
 	}
 	_, _, newLeaf, _ := m.lookup(newName)
 	if old := dir.curEntries[newLeaf]; old != nil && !old.isDir {
-		m.used -= int64(len(old.cur))
+		m.used -= old.footprint()
 	}
 	dir.curEntries[newLeaf] = n
 	delete(dir.curEntries, oldLeaf)
@@ -397,7 +555,12 @@ func (m *MemFS) SyncDir(name string) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.fault(OpSyncDir, name) != nil {
+	fault, err := m.begin(OpSyncDir, name)
+	defer m.fire()
+	if err != nil {
+		return err
+	}
+	if fault != nil {
 		return injected(OpSyncDir, name)
 	}
 	n, _, _, err := m.lookup(name)
@@ -418,6 +581,9 @@ func (m *MemFS) List(name string) ([]string, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.alive("list", name); err != nil {
+		return nil, err
+	}
 	n, _, _, err := m.lookup(name)
 	if err != nil {
 		return nil, err
@@ -440,6 +606,9 @@ func (m *MemFS) Exists(name string) (bool, error) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.alive("exists", name); err != nil {
+		return false, err
+	}
 	n, _, _, err := m.lookup(name)
 	if errs.CodeOf(err) == errs.CodeNotFound {
 		return false, nil
@@ -472,6 +641,9 @@ type memFile struct {
 
 // check is called with fs.mu held.
 func (f *memFile) check(op string) error {
+	if err := f.fs.alive(op, f.name); err != nil {
+		return err
+	}
 	if f.closed || f.epoch != f.fs.epoch {
 		return errs.Newf(errs.CodeClosed, "vfs.mem."+op, "%q: handle closed", f.name)
 	}
@@ -507,7 +679,11 @@ func (f *memFile) WriteAt(p []byte, off int64) error {
 		return errs.Newf(errs.CodeInvalidArgument, "vfs.mem.write", "negative offset %d", off)
 	}
 	data := p
-	fault := f.fs.fault(OpWrite, f.name)
+	fault, err := f.fs.begin(OpWrite, f.name)
+	defer f.fs.fire()
+	if err != nil {
+		return err
+	}
 	if fault != nil && !fault.ShortWrite {
 		return injected(OpWrite, f.name)
 	}
@@ -515,12 +691,15 @@ func (f *memFile) WriteAt(p []byte, off int64) error {
 		data = p[:len(p)/2]
 	}
 	end := off + int64(len(data))
-	if grow := end - int64(len(f.node.cur)); grow > 0 && f.fs.capacity > 0 && f.fs.used+grow > f.fs.capacity {
+	if grow := end - f.node.footprint(); grow > 0 && f.fs.capacity > 0 && f.fs.used+grow > f.fs.capacity {
 		return errs.Newf(errs.CodeNoSpace, "vfs.mem.write", "%q: no space left", f.name).
 			With("capacity", f.fs.capacity)
 	}
-	if grow := end - int64(len(f.node.cur)); grow > 0 {
+	if grow := end - f.node.footprint(); grow > 0 {
 		f.fs.used += grow
+	}
+	f.node.written = max(f.node.written, end)
+	if end > int64(len(f.node.cur)) {
 		f.node.cur = resize(f.node.cur, end)
 	}
 	copy(f.node.cur[off:], data)
@@ -552,19 +731,48 @@ func (f *memFile) Truncate(size int64) error {
 	if size < 0 {
 		return errs.Newf(errs.CodeInvalidArgument, "vfs.mem.truncate", "negative size %d", size)
 	}
-	if f.fs.fault(OpTrunc, f.name) != nil {
+	fault, err := f.fs.begin(OpTrunc, f.name)
+	defer f.fs.fire()
+	if err != nil {
+		return err
+	}
+	if fault != nil {
 		return injected(OpTrunc, f.name)
 	}
-	f.fs.used += size - int64(len(f.node.cur))
+	// Extending is sparse on the OS file systems: it never fails for space.
+	before := f.node.footprint()
 	f.node.cur = resize(f.node.cur, size)
+	f.node.written = min(f.node.written, size)
+	f.fs.used += f.node.footprint() - before
 	f.node.pending = append(f.node.pending, memOp{truncate: size})
 	return nil
 }
 
-func (f *memFile) Preallocate(int64) error {
+// Preallocate reserves space up to size against the capacity, without
+// changing the size of the file. As the File contract says, failing to
+// reserve is not an error: it reserves what fits, and an injected fault
+// reserves nothing.
+func (f *memFile) Preallocate(size int64) error {
 	f.fs.mu.Lock()
 	defer f.fs.mu.Unlock()
-	return f.check("preallocate")
+	if err := f.check("preallocate"); err != nil {
+		return err
+	}
+	fault, err := f.fs.begin(OpPrealloc, f.name)
+	defer f.fs.fire()
+	if err != nil {
+		return err
+	}
+	grow := size - f.node.footprint()
+	if fault != nil || grow <= 0 {
+		return nil
+	}
+	if f.fs.capacity > 0 {
+		grow = min(grow, max(0, f.fs.capacity-f.fs.used))
+	}
+	f.fs.used += grow
+	f.node.reserved = f.node.footprint() + grow
+	return nil
 }
 
 func (f *memFile) Sync() error {
@@ -573,7 +781,12 @@ func (f *memFile) Sync() error {
 	if err := f.check("sync"); err != nil {
 		return err
 	}
-	if f.fs.fault(OpSync, f.name) != nil {
+	fault, err := f.fs.begin(OpSync, f.name)
+	defer f.fs.fire()
+	if err != nil {
+		return err
+	}
+	if fault != nil {
 		return injected(OpSync, f.name)
 	}
 	f.node.dur = append([]byte(nil), f.node.cur...)
