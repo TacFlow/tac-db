@@ -74,6 +74,9 @@ jobs:
           for f in FuzzBTreeOps FuzzForgedTree; do
             go test ./internal/btree -run '^$' -fuzz="^${f}\$" -fuzztime=60s
           done
+          for f in FuzzRecordDecode FuzzSegmentScan; do
+            go test ./internal/wal -run '^$' -fuzz="^${f}\$" -fuzztime=60s
+          done
 
   deps:
     runs-on: ubuntu-latest
