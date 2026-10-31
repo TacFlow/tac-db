@@ -92,7 +92,7 @@ Implementation: `internal/vfs`. A database `name.tacdb` lives in one directory a
 |---|---|
 | `name.tacdb` | Main file. |
 | `name.tacdb.lock` | Lock file: created empty on first open and never removed, so the lock name never changes. |
-| `name.tacdb-wal/` | Directory of the WAL segments (M2), each named `NNNNNNNNNNNNNNNN.wal` with 16 hexadecimal digits. |
+| `name.tacdb-wal/` | Directory of the WAL (§12): segments named `NNNNNNNNNNNNNNNN.wal` with the 16 hexadecimal digits of their sequence number, and `spare.tmp`, the next segment prepared in advance. |
 | Temporaries (M2) | Always in the destination directory, with the database prefix and a random `crypto/rand` suffix. |
 
 Every name goes through `vfs.ValidName`: one or two components separated by `/`, each starting with a letter or digit, made only of letters, digits, `.`, `_` and `-`, not ending with `.`, and not a reserved Windows device name (`CON`, `NUL`, `COM1` and the like). Any other name is `UNSAFE_PATH`.
@@ -191,3 +191,82 @@ Implementation: `internal/btree`, `internal/alloc`, `internal/check`. `btree.Ver
 - **Bitmaps.** A bit is set if and only if its page is owned. Bits of pages at or beyond `pageCount` are zero, and `free_page_count` is the number of clear bits of data pages below `pageCount`.
 
 The placement of pages and the choice of separators are policy, not format: a reader accepts any state that follows the rules above. tacdb splits a leaf with the shortest valid separator, `min(R)[:lcp(max(L), min(R)) + 1]`, and an internal page by moving its middle separator up; merges and redistributions keep the separators valid but not necessarily shortest. tacdb takes a new page from the lowest free address of the group of a related page (a sibling or the parent), then from the lowest free address, then from the end of the file, where reaching the position of the next bitmap page creates that group. A value takes one contiguous free run when there is one; otherwise free runs from the lowest address, completed at the end of the file; and when that would take more than 337 extents, one run at the end of the file, broken only by bitmap pages (R13-02). Freeing a page only clears its bit; `pageCount` does not shrink.
+
+## 12. Write-ahead log
+
+Implementation: `internal/wal`. Golden images: `internal/wal/testdata/golden/*.bin`, written with a fixed clock (R13-12). All integers are little-endian; CRCs are CRC32C (Castagnoli).
+
+### 12.1 Segments
+
+A segment has a 4096-byte header, followed by records. It is created at its target size (`WALSegmentBytes`, 64 MiB by default) filled with zeros; a group never splits across segments, so a segment may grow past its target to finish one. Writer and recovery share a bound on the size of a segment (256 MiB by default): the writer refuses a group that would not fit a new segment under it, and recovery refuses a larger segment.
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 8 | Magic `TACWAL2\0`. |
+| 8 | 2 | Version = 2. |
+| 10 | 2 | `header_bytes` = 4096. |
+| 12 | 4 | `page_size` = 4096. |
+| 16 | 16 | Database UUID. |
+| 32 | 8 | `segment_seq`: starts at 1 and grows by one; never reused. |
+| 40 | 8 | `first_lsn`: LSN of the first record of the segment. |
+| 48 | 8 | `base_checkpoint_lsn` in force when the segment was created. |
+| 56 | 8 | `created_unix_ns` (i64), from an injectable clock. |
+| 64 | 2 | `format_revision` = 13. |
+| 66 | 2 | Reserved, zero. |
+| 68 | 8 | `prev_valid_end`: where the valid data of the previous segment ends; zero in segment 1 (R13-23). |
+| 76 | 4016 | Reserved, zero. |
+| 4092 | 4 | CRC of bytes 0..4091. |
+
+**Rolling to the next segment.** The next segment is prepared in the background as `spare.tmp`: created, sized and synced. To move appends to it, the writer syncs the current segment, writes the real header into the spare and syncs it, renames it to its final name and syncs the directory. Every segment except the last is therefore complete on disk. A `spare.tmp` found when opening is discarded.
+
+**After recovery.** When recovery discarded a tail (§12.4), the next writer starts a new segment whose `prev_valid_end` marks the end of the recovered prefix; the bytes after it are never read again, so a discarded tail cannot come back under reused LSNs. Otherwise appends continue in the last segment, after its last valid record.
+
+**Floor.** `wal_floor_segment` in the superblock is the segment after the one holding `checkpoint_lsn` if that segment already has its final name, else the segment holding `checkpoint_lsn`; records up to `checkpoint_lsn` are skipped.
+
+### 12.2 Records
+
+A record has a 64-byte header, then the payload, then zero padding to a multiple of 8 bytes; it is at most 8192 bytes long.
+
+| Offset | Bytes | Field |
+|---:|---:|---|
+| 0 | 4 | Magic `0x32524354`. |
+| 4 | 1 | Type: BEGIN 1, PAGE 2, COMMIT 3, ABORT 4, RESERVE_IDS 5, APPLIED 6 (cluster only). |
+| 5 | 1 | Flags, zero. |
+| 6 | 2 | Header size, 64. |
+| 8 | 4 | Total length, header and padding included. |
+| 12 | 4 | Payload length. |
+| 16 | 8 | LSN; every record has the LSN of the previous one plus one. |
+| 24 | 8 | GroupID; zero in RESERVE_IDS. |
+| 32 | 8 | CommitID: of the intent (BEGIN), of the page version (PAGE) or of the last intent (COMMIT); zero in RESERVE_IDS. |
+| 40 | 8 | LSN of the previous record of the same group, or zero. |
+| 48 | 8 | PageID in PAGE; zero otherwise. |
+| 56 | 4 | Reserved, zero. |
+| 60 | 4 | CRC of header, payload and padding, computed with this field zeroed. |
+
+| Type | Payload |
+|---|---|
+| BEGIN | 48 bytes: `token:16` (random), `parentCommitID:u64`, `commitID:u64`, `flags:u32` (zero), reserved `u32`, `durable_lsn:u64`. |
+| PAGE | The 4096-byte image of the final version of the page in the group, with its CommitID and CRC. |
+| COMMIT | `intent_count:u32`, `page_count:u32`, the 384-byte State and the 32-byte manifest digest. |
+| ABORT | Empty: the group in progress is not recognized. |
+| RESERVE_IDS | `kind:u8` (node 1, edge 2), 7 zero bytes, `high_watermark:u64`. Written only between groups. |
+
+**State (384 bytes).** Nine u64 — CommitID, schema epoch, node count, edge count, NodeID, EdgeID and SymbolID high-watermarks, `pageCount`, `free_page_count` — then the 32 roots, `parentCommitID` at offset 328, the applied Raft index and term at 336 and 344 (zero in standalone) and 32 zero bytes.
+
+**Manifest.** The digest is the SHA-256 of, in LSN order: for each BEGIN, `token + parentCommitID + commitID`; for each PAGE, `PageID:u64` and the 4-byte CRC field of the page.
+
+### 12.3 Groups
+
+A group is its BEGINs, in the order of the chain of intents, then one PAGE per PageID in increasing order, each with the final version of the page in the group, then the COMMIT. The first BEGIN has as parent the last recovered CommitID; each following BEGIN has as parent the commit of the previous one; the COMMIT counts the intents and pages, carries the State of the last intent and the digest of the manifest. Groups have increasing GroupIDs, also across checkpoints: a writer resumes after the highest GroupID in the log, checkpointed groups included. The writer applies the same checks as recovery before appending, so it never acknowledges a group that recovery would refuse.
+
+**`durable_lsn` (R13-23).** The highest LSN of any record whose write completed before a Sync that then returned success, as known when the group was formed. It is a lower bound: a lower value only weakens the detection below, a higher one would turn an ordinary crash into `CORRUPT`.
+
+### 12.4 Recovery of the log
+
+1. The segments from the floor up must form a contiguous sequence, carry the database UUID and have continuous LSNs; the first starts at or before `checkpoint_lsn + 1`. Anything else in the directory except `spare.tmp` is `CORRUPT`. A segment below the floor is a removable leftover once its header shows it belongs to the database; a spare is always removable. A segment larger than the scan bound (256 MiB by default) is `CORRUPT`.
+2. A segment that is not the last is valid up to the `prev_valid_end` declared by the next one; any defect before that point is `CORRUPT`.
+3. In the last segment, the data ends at a record whose magic is zero and after which every byte is zero. Records up to `checkpoint_lsn` are skipped with only their fixed header fields checked; the log must reach `checkpoint_lsn`, which the checkpoint proves durable, so a log that ends before it, or a defect before it, is `CORRUPT`.
+4. Only complete, valid groups are recovered: CRCs, LSNs, the chain of the group, counts, the chain of parents, increasing GroupIDs, the digest, and every page image (`page.Verify`, a PageID from 2 to below the `pageCount` of the group's State, and the CommitID of one of its intents). ABORT has no payload and ends the group in progress without recognizing it. An APPLIED record in a standalone log is `UNSUPPORTED_FORMAT`.
+5. A defect in the last segment — an invalid record, an incomplete group, a broken chain, or a zero magic followed by data — at the end P of the last complete unit is classified by evidence. An unsynced append may reach the disk in any order, so a later record can be intact while an earlier one is not. The rest of the segment is searched, at 8-byte boundaries, for plausible records — fixed header fields, an LSN at or after the one at P and within what the segment can hold, and the payload length of a BEGIN or a RESERVE_IDS, all checked before the CRC — whose CRC is valid. If any BEGIN among them declares a `durable_lsn` at or beyond the LSN at P, the region had been synced and the log is `CORRUPT`; otherwise the tail is discarded. RESERVE_IDS records with a valid CRC in a discarded tail are still applied, which only skips identifiers.
+
+The last synced group has no later evidence: if it is corrupted on the medium after its Sync and nothing newer survives, it is discarded as a tail. This residual risk is accepted (R13-23).

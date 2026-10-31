@@ -77,7 +77,7 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | R13-09 | An orphan WAL from an interrupted creation blocked `Open(Create)` | M2 | pending | — |
 | R13-10 | Go 1.27.2 already superseded by a fix release | M1 | partial | M1a: `go.mod` pins `toolchain go1.27.3`; done with the first green CI run |
 | R13-11 | Inconsistent names: the dictionary scan metric had two names; `compatibility.md` | M0 | done | SPEC 1.3 (§2 and §13.3) |
-| R13-12 | `created_unix_ns` prevented byte-for-byte binary goldens | M2 | pending | — |
+| R13-12 | `created_unix_ns` prevented byte-for-byte binary goldens | M2 | done | M2a: injectable clock in `internal/wal`; golden segment header and records (`TestGoldenRecords`) |
 | R13-13 | The reference engine named in code and documentation | M0 | partial | SPEC 1.3 §2.1 and the CI `names` job; needs the `FORBIDDEN_NAMES_REGEX` repository variable |
 | R13-14 | Snowball pt/en "in pure Go" with no defined source | M5 | pending | — |
 | R13-15 | Format ambiguities: the length used by the inline rule, `key_len` of internal cells, when to set PREFIX, bitmap bit order, the canonical descriptor form and mixed superblock copies | M1 | done | M1c: definitions in `internal/page`, golden pages, `FuzzPage`, `FuzzSuperblock` |
@@ -88,3 +88,4 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | R13-20 | A superblock copy from a future revision could be classified as damaged and silently reopen the older copy | M1 | done | M1c: `Classify` and `ChooseSuperblock` (`TestClassify`, `TestChooseSuperblock`) |
 | R13-21 | Windows permissions without an owner check, macOS extended ACLs ignored, Windows junctions outside the symlink rule, path-based checks and inheritable ACEs ignored | M1 | partial | M1b: `internal/vfs`; verified on Linux and macOS, Windows depends on the CI (SEC-08) |
 | R13-22 | Write cursors survived a savepoint restore, and a counter restored with the savepoint allowed ABA | M1/M2 | partial | M1e: per-tree mutation counters and the restore counter of the transaction, both monotonic (`TestCursorInvalidation`); the overlay of M2 |
+| R13-23 | The tail rule of §11.2 turned an ordinary power loss into CORRUPT when an unsynced append reached the disk out of order, or would drop an acknowledged commit corrupted after its Sync | M2 | partial | M2a: `durable_lsn` in BEGIN, segment roll through `spare.tmp`, new segment after a discarded tail, evidence-based tail classification (`TestTornTailIsDiscarded`, `TestCorruptionAfterSync`, `TestDiscardedTailDoesNotResurrect`); the crash matrix in M2e |
