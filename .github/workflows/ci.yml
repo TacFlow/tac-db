@@ -36,6 +36,14 @@ jobs:
         env:
           CGO_ENABLED: "0"
         run: go build ./...
+      - name: platform cases ran
+        shell: bash
+        run: |
+          # These cases skip when the file system refuses hard links or
+          # junctions; on the CI runners they must run (R13-04, R13-21).
+          out=$(go test -count=1 -v -run 'TestLockAcrossProcesses|TestWindowsJunction' ./internal/vfs)
+          echo "$out"
+          if grep -q -- '--- SKIP' <<<"$out"; then echo "a platform case was skipped"; exit 1; fi
 
   race:
     name: race (${{ matrix.os }})
