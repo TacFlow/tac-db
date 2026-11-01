@@ -363,3 +363,32 @@ func TestReclaimers(t *testing.T) {
 	big.Close()
 	cached.Close()
 }
+
+func TestTransfer(t *testing.T) {
+	g, err := New(Config{Limit: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := g.Reserve(context.Background(), Overlay, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := r.Transfer(Sealed)
+	if st := g.Stats(); st.Used[Overlay] != 0 || st.Used[Sealed] != 60 || s.Bytes() != 60 || r.Bytes() != 0 {
+		t.Fatalf("after Transfer: %+v, held %d and %d", st.Used, s.Bytes(), r.Bytes())
+	}
+	if err := r.TryGrow(1); !isCode(err, errs.CodeClosed) {
+		t.Fatalf("the source must be closed: %v", err)
+	}
+	r.Close() // idempotent, returns nothing more
+	if g.Stats().Used[Sealed] != 60 {
+		t.Fatal("closing the source returned memory it no longer holds")
+	}
+	if e := r.Transfer(Sealed); e.Bytes() != 0 {
+		t.Fatal("a closed reservation transferred bytes")
+	}
+	s.Close()
+	if st := g.Stats(); st.Used != [NumCategories]int64{} {
+		t.Fatalf("leak: %+v", st.Used)
+	}
+}
