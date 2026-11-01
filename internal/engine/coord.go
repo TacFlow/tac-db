@@ -24,6 +24,12 @@ const (
 	Durable
 )
 
+// token is what the handle remembers of a commit token.
+type token struct {
+	status Status
+	commit uint64
+}
+
 // intent is a sealed transaction on its way to the log.
 type intent struct {
 	commit, parent uint64
@@ -57,11 +63,14 @@ type coordinator struct {
 	wake      chan struct{}
 	quit      chan struct{}
 	done      chan struct{}
-	flush     atomic.Bool // a Flush waits
-	room      atomic.Bool // a commit waits for room in the queue
-	group     uint64      // last GroupID
-	floor     uint64      // wal_floor_segment in force
-	walEnd    atomic.Int64
+	flush     atomic.Bool           // a Flush waits
+	room      atomic.Bool           // a commit waits for room in the queue
+	group     uint64                // last GroupID
+	seq, off  atomic.Int64          // where the next record goes
+	floor     atomic.Int64          // the lowest segment kept
+	ckLSN     atomic.Uint64         // checkpoint_lsn in force, for new segment headers
+	ext       atomic.Pointer[error] // a fatal error found outside the coordinator
+	inflight  []*intent             // taken from the queue, not yet appended
 	unsynced  []*appended
 	reserves  []reserveLSN // appended, not yet durable
 	sinceSync int64
@@ -91,10 +100,28 @@ func (c *coordinator) stop() {
 	<-c.done
 }
 
-// setWALEnd records the bytes of log above the floor, for MaxWALBytes.
-func (c *coordinator) setWALEnd(db *DB) {
+// setPosition records where the log ends, for MaxWALBytes and the
+// checkpoint trigger, and asks for a checkpoint when the log grew enough.
+func (c *coordinator) setPosition(db *DB) {
 	p := db.w.Position()
-	c.walEnd.Store(int64(p.Seq-c.floor)*db.opts.WALSegmentBytes + p.Offset)
+	c.seq.Store(int64(p.Seq))
+	c.off.Store(p.Offset)
+	if db.mt.due(db) {
+		db.mt.signal()
+	}
+}
+
+// walBytes is the size of the log, counted in segment files: every kept
+// segment but the last is SegmentBytes, the last up to its end.
+func (c *coordinator) walBytes(db *DB) int64 {
+	return (c.seq.Load()-c.floor.Load())*db.opts.WALSegmentBytes + c.off.Load()
+}
+
+// abort makes the coordinator fail the handle with err, from another
+// goroutine: only the coordinator touches its groups.
+func (c *coordinator) abort(err error) {
+	c.ext.CompareAndSwap(nil, &err)
+	c.signal()
 }
 
 func (c *coordinator) run(db *DB) {
@@ -114,7 +141,11 @@ func (c *coordinator) run(db *DB) {
 		case <-c.quit:
 			return
 		}
-		if err := c.cycle(db, due); err != nil {
+		err := c.cycle(db, due)
+		if p := c.ext.Load(); p != nil && err == nil {
+			err = *p
+		}
+		if err != nil {
 			// A roll may have synced groups before the failing call:
 			// they are durable and keep their status.
 			c.publish(db)
@@ -128,6 +159,10 @@ func (c *coordinator) run(db *DB) {
 // is nothing left.
 func (c *coordinator) cycle(db *DB, due bool) error {
 	for {
+		if c.ext.Load() != nil {
+			return nil // run fails the handle
+		}
+		db.w.SetCheckpointLSN(c.ckLSN.Load())
 		reqs := db.ids.take()
 		for _, r := range reqs { // between groups, never inside one
 			lsn, err := db.w.AppendReserve(r)
@@ -139,11 +174,13 @@ func (c *coordinator) cycle(db *DB, due bool) error {
 		}
 		batch := db.takeBatch()
 		if len(batch) > 0 {
+			c.inflight = batch // until appended, the batch is in neither queue
 			if err := c.append(db, batch); err != nil {
 				return err
 			}
+			c.inflight = nil
 		}
-		c.setWALEnd(db)
+		c.setPosition(db)
 		c.publish(db) // a roll syncs what came before
 		groups := len(c.unsynced) > 0
 		var sync bool
@@ -265,7 +302,7 @@ func (c *coordinator) append(db *DB, batch []*intent) error {
 		db.mu.Lock()
 		db.visible.Store(dir)
 		for _, in := range batch {
-			db.tokens[in.token] = Volatile
+			db.tokens[in.token] = token{Volatile, in.commit}
 			in.finish(false, nil)
 		}
 		db.mu.Unlock()
@@ -279,6 +316,7 @@ func (c *coordinator) publish(db *DB) {
 	d := db.w.DurableLSN()
 	for len(c.reserves) > 0 && c.reserves[0].lsn <= d {
 		db.ids.durable(c.reserves[0].Reserve)
+		db.mt.noteReserve(c.reserves[0])
 		c.reserves = c.reserves[1:]
 	}
 	n := 0
@@ -304,7 +342,7 @@ func (c *coordinator) publish(db *DB) {
 			s.Release() // reads go to the log now
 		}
 		for _, in := range g.intents {
-			db.tokens[in.token] = Durable
+			db.tokens[in.token] = token{Durable, in.commit}
 			in.res.Close()
 			db.pending--
 			db.pendBytes -= in.bytes
@@ -337,10 +375,11 @@ func (db *DB) fail(cause error) {
 	for _, g := range db.co.unsynced {
 		lost = append(lost, g.intents...)
 	}
+	lost = append(lost, db.co.inflight...)
 	lost = append(lost, db.queue...)
-	db.co.unsynced, db.queue = nil, nil
+	db.co.unsynced, db.co.inflight, db.queue = nil, nil, nil
 	for _, in := range lost {
-		db.tokens[in.token] = Unknown
+		db.tokens[in.token] = token{Unknown, in.commit}
 		in.res.Close()
 		select {
 		case <-in.done: // a volatile receipt of Async
@@ -359,14 +398,36 @@ func (db *DB) fail(cause error) {
 // unless wait is false; a commit alone always fits.
 func (db *DB) reserveQueue(ctx context.Context, bytes int64, wait bool) error {
 	const op = "engine.Commit"
+	var ev *Event
+	defer func() { // after the unlock below
+		if ev != nil {
+			db.emit(*ev)
+		}
+	}()
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	relieved := false
 	for {
 		if err := db.usable(op); err != nil {
 			return err
 		}
-		if db.co.walEnd.Load()+db.unappended+bytes > db.opts.MaxWALBytes {
-			return errs.New(errs.CodeWALLimit, op, "the commit would pass MaxWALBytes").With("limit", db.opts.MaxWALBytes)
+		if db.co.walBytes(db)+db.unappended+bytes > db.opts.MaxWALBytes {
+			if !relieved && wait {
+				// Apply the pressure policy and checkpoint before refusing
+				// (SPEC §10.4).
+				relieved = true
+				db.mu.Unlock()
+				err := db.mt.relieve(ctx, db)
+				db.mu.Lock()
+				if err != nil {
+					return err
+				}
+				continue
+			}
+			db.mt.signal()
+			e, err := db.walLimit(op)
+			ev = &e
+			return err
 		}
 		if db.pending == 0 || db.pending < db.opts.MaxPendingCommits && db.pendBytes+bytes <= db.opts.MaxPendingCommitBytes {
 			db.pending++
@@ -454,5 +515,5 @@ func (db *DB) Flush(ctx context.Context) error {
 func (db *DB) CommitStatus(token [16]byte) Status {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	return db.tokens[token]
+	return db.tokens[token].status
 }

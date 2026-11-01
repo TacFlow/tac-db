@@ -97,7 +97,7 @@ func TestStress(t *testing.T) {
 				t.Fatalf("governor leftovers: overlay %d sealed %d", st.Used[govern.Overlay], st.Used[govern.Sealed])
 			}
 			for s, v := range db.tokens {
-				if v != Durable {
+				if v.status != Durable {
 					t.Fatalf("token %x status %v after Flush", s, v)
 				}
 			}

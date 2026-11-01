@@ -219,6 +219,9 @@ func checkStale(in ScanInput, seq uint64) error {
 	return nil
 }
 
+// ParseSegmentName returns the seq of a segment file name.
+func ParseSegmentName(name string) (uint64, bool) { return parseSegmentName(name) }
+
 func parseSegmentName(name string) (uint64, bool) {
 	hex, ok := strings.CutSuffix(name, ".wal")
 	if !ok || len(hex) != 16 || strings.ToLower(hex) != hex {

@@ -153,5 +153,11 @@ func (b *Backing) direct(dst *page.Buf, d *Directory, id page.ID) error {
 	return nil
 }
 
+// ReadVersion reads the version of id in d, verified, without the cache:
+// the checkpoint copies versions to the main file this way.
+func (b *Backing) ReadVersion(dst *page.Buf, d *Directory, id page.ID) error {
+	return b.direct(dst, d, id)
+}
+
 // Snapshot returns a read-only view of the directory d.
 func (b *Backing) Snapshot(d *Directory) *View { return &View{b: b, dir: d} }

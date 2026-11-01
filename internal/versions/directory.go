@@ -100,6 +100,15 @@ func (d *Directory) Lookup(id page.ID) (Loc, bool) { return d.pages.Get(uint64(i
 // Len returns the number of pages with an entry.
 func (d *Directory) Len() int { return d.pages.Len() }
 
+// Newer calls yield, in PageID order, for each page whose version in d is
+// newer than commit after, with the CommitID of that version, until yield
+// returns false. A checkpoint from base after copies these versions.
+func (d *Directory) Newer(after uint64, yield func(id page.ID, commit uint64) bool) {
+	d.pages.All(func(k uint64, l Loc) bool {
+		return l.commit <= after || yield(page.ID(k), l.commit)
+	})
+}
+
 // Version is a page and the location of its new version.
 type Version struct {
 	ID  page.ID

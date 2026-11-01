@@ -401,7 +401,7 @@ func TestCommitQueueAndWALLimit(t *testing.T) {
 		t.Fatalf("after the queue drained: %v", got)
 	}
 
-	db.opts.MaxWALBytes = db.co.walEnd.Load() + 1000
+	db.opts.MaxWALBytes = db.co.walBytes(db) + 1000
 	tx, _ = db.BeginWrite(ctx)
 	tx.Put(ctx, 0, []byte("d"), []byte("1"))
 	if _, err := tx.Commit(ctx); !isCode(err, errs.CodeWALLimit) {
@@ -485,9 +485,9 @@ func TestWALLimitCountsOnce(t *testing.T) {
 	defer db.Close()
 	g.hold()
 	first := commitAsync(t, db, "big", string(make([]byte, 40<<10)))
-	<-g.entered // appended: in walEnd, still pending
+	<-g.entered // appended: in walBytes, still pending
 	db.mu.Lock()
-	db.opts.MaxWALBytes = db.co.walEnd.Load() + db.pendBytes/2
+	db.opts.MaxWALBytes = db.co.walBytes(db) + db.pendBytes/2
 	db.mu.Unlock()
 	tx, _ := db.BeginWrite(ctx)
 	tx.Put(ctx, 0, []byte("small"), []byte("v"))

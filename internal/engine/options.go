@@ -5,6 +5,7 @@
 package engine
 
 import (
+	"math"
 	"time"
 
 	"github.com/TacFlow/tacdb/internal/errs"
@@ -26,6 +27,24 @@ const (
 	// a periodic Sync, Flush or a byte limit makes it durable.
 	Async
 )
+
+// PressurePolicy says what happens when snapshots keep log segments from
+// being removed (SPEC §10.1).
+type PressurePolicy int
+
+// Pressure policies.
+const (
+	// ExpireOldest revokes the oldest snapshots, from the oldest on, once
+	// they are at least MinSnapshotAgeForEviction old.
+	ExpireOldest PressurePolicy = iota
+	// RejectWrites keeps the readers and refuses commits with WAL_LIMIT
+	// once the log reaches MaxWALBytes.
+	RejectWrites
+)
+
+// Unlimited is the MaxReadTxAge that never revokes by age; it must be set
+// explicitly.
+const Unlimited time.Duration = math.MaxInt64
 
 // Options configure a handle. Start from DefaultOptions: a zero
 // BusyTimeout, for example, means fail at once, as SPEC §10.2 says.
@@ -53,6 +72,25 @@ type Options struct {
 	IDReservationInitial uint64
 	IDReservationMax     uint64
 
+	// The passive checkpoint runs every CheckpointBytes of log, or when
+	// more than CheckpointSegments segments lie above the floor (SPEC
+	// §10.4, §11.1). ScrubFreedPages writes zeroed free pages (§8.4).
+	CheckpointBytes    int64
+	CheckpointSegments int
+	ScrubFreedPages    bool
+	// MaintenanceInterval is how often the maintenance goroutine checks
+	// snapshot ages and log pressure without a trigger.
+	MaintenanceInterval time.Duration
+
+	MaxReadTxAge              time.Duration // Unlimited to never revoke by age
+	SnapshotPressurePolicy    PressurePolicy
+	WALPinnedSoftBytes        int64 // log kept by snapshots before the policy acts
+	MinSnapshotAgeForEviction time.Duration
+	// OnEvent receives the diagnostic events of maintenance, on the
+	// goroutine that found them (maintenance, a commit or a reader), with
+	// no lock of the handle held; it must not block.
+	OnEvent func(Event)
+
 	CacheBytes  int64
 	Governor    *govern.Governor // nil means govern.Default()
 	PruneBudget int              // radix nodes pruned per commit
@@ -67,25 +105,33 @@ const MaxGroupBytes = wal.DefaultMaxSegmentBytes / 2
 // DefaultOptions returns the defaults of SPEC §9 and §10.
 func DefaultOptions() Options {
 	return Options{
-		Durability:            GroupSync,
-		BusyTimeout:           5 * time.Second,
-		MaxWriterQueue:        128,
-		MaxActiveTransactions: 1024,
-		MaxWriteTxDuration:    30 * time.Second,
-		MaxTxBytes:            64 << 20,
-		MaxPendingCommits:     256,
-		MaxPendingCommitBytes: 128 << 20,
-		MaxWALBytes:           1 << 30,
-		WALSegmentBytes:       64 << 20,
-		GroupMaxCommits:       64,
-		GroupMaxBytes:         8 << 20,
-		AsyncSyncInterval:     100 * time.Millisecond,
-		AsyncSyncBytes:        16 << 20,
-		IDReservationInitial:  1024,
-		IDReservationMax:      1 << 20,
-		CacheBytes:            64 << 20,
-		PruneBudget:           64,
-		Now:                   time.Now,
+		Durability:                GroupSync,
+		BusyTimeout:               5 * time.Second,
+		MaxWriterQueue:            128,
+		MaxActiveTransactions:     1024,
+		MaxWriteTxDuration:        30 * time.Second,
+		MaxTxBytes:                64 << 20,
+		MaxPendingCommits:         256,
+		MaxPendingCommitBytes:     128 << 20,
+		MaxWALBytes:               1 << 30,
+		WALSegmentBytes:           64 << 20,
+		GroupMaxCommits:           64,
+		GroupMaxBytes:             8 << 20,
+		AsyncSyncInterval:         100 * time.Millisecond,
+		AsyncSyncBytes:            16 << 20,
+		IDReservationInitial:      1024,
+		IDReservationMax:          1 << 20,
+		CheckpointBytes:           64 << 20,
+		CheckpointSegments:        4,
+		ScrubFreedPages:           true,
+		MaintenanceInterval:       time.Second,
+		MaxReadTxAge:              10 * time.Minute,
+		SnapshotPressurePolicy:    ExpireOldest,
+		WALPinnedSoftBytes:        512 << 20,
+		MinSnapshotAgeForEviction: 30 * time.Second,
+		CacheBytes:                64 << 20,
+		PruneBudget:               64,
+		Now:                       time.Now,
 	}
 }
 
@@ -98,13 +144,17 @@ func (o *Options) check() error {
 		return bad("durability mode")
 	case o.Create && o.ReadOnly:
 		return bad("Create with ReadOnly")
-	case o.BusyTimeout < 0 || o.MaxWriteTxDuration <= 0 || o.AsyncSyncInterval <= 0:
+	case o.BusyTimeout < 0 || o.MaxWriteTxDuration <= 0 || o.AsyncSyncInterval <= 0 ||
+		o.MaintenanceInterval <= 0 || o.MaxReadTxAge <= 0 || o.MinSnapshotAgeForEviction < 0:
 		return bad("durations")
 	case o.MaxWriterQueue <= 0 || o.MaxActiveTransactions <= 0 || o.MaxPendingCommits <= 0 || o.GroupMaxCommits <= 0:
 		return bad("counts")
 	case o.MaxTxBytes <= 0 || o.MaxPendingCommitBytes <= 0 || o.MaxWALBytes <= 0 || o.WALSegmentBytes <= 0 ||
-		o.GroupMaxBytes <= 0 || o.AsyncSyncBytes <= 0 || o.CacheBytes <= 0:
+		o.GroupMaxBytes <= 0 || o.AsyncSyncBytes <= 0 || o.CacheBytes <= 0 ||
+		o.CheckpointBytes <= 0 || o.CheckpointSegments <= 0 || o.WALPinnedSoftBytes <= 0:
 		return bad("sizes")
+	case o.SnapshotPressurePolicy < ExpireOldest || o.SnapshotPressurePolicy > RejectWrites:
+		return bad("snapshot pressure policy")
 	case o.IDReservationInitial == 0 || o.IDReservationMax < o.IDReservationInitial:
 		return bad("identifier reservation blocks")
 	case o.PruneBudget <= 0 || o.Now == nil:

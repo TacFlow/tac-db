@@ -24,7 +24,8 @@ type DB struct {
 	walDir string
 	opts   Options
 	uuid   [16]byte
-	sb     page.Superblock // the superblock in force
+	sb     page.Superblock // the superblock in force; the checkpoint changes it
+	sbSlot page.ID         // the page that holds it, 0 or 1
 
 	lock  *vfs.DatabaseLock
 	main  vfs.File
@@ -42,7 +43,8 @@ type DB struct {
 	active                   atomic.Int64 // open transactions
 	closed                   atomic.Bool
 	failedErr                atomic.Pointer[error]
-	firstCommit              uint64 // CommitIDs above it were issued by this handle
+	firstCommit              uint64        // CommitIDs above it were issued by this handle
+	walFloor                 atomic.Uint64 // wal_floor_segment of the base T in force
 
 	// mu is the coordination mutex: admission, sealing, failure and the
 	// token history. It is never held during I/O or a wait.
@@ -54,10 +56,11 @@ type DB struct {
 	pendBytes  int64
 	unappended int64         // reserved bytes not yet in the log, for MaxWALBytes
 	queueFree  chan struct{} // closed and replaced when pending shrinks
-	tokens     map[[16]byte]Status
+	tokens     map[[16]byte]token
 	durableCh  chan struct{} // closed and replaced when durable advances or the handle fails
 
 	co    coordinator
+	mt    maintainer
 	ids   idAlloc
 	stats counters
 	hooks hooks
@@ -67,6 +70,7 @@ type DB struct {
 type hooks struct {
 	afterRegister func() // a snapshot is registered, the head not loaded yet
 	betweenHeads  func() // visibleHead is stored, durableHead not yet
+	checkpoint    func(stage string)
 }
 
 // Stats are counters of a handle.
@@ -78,10 +82,20 @@ type Stats struct {
 	Groups             int64
 	Intents            int64
 	CoalescedPages     int64 // page versions replaced inside a group
+
+	Checkpoints      int64
+	CheckpointPages  int64 // versions copied to the main file
+	ScrubbedPages    int64 // zeroed free pages written
+	SegmentsRemoved  int64
+	SnapshotsExpired int64 // revoked for MaxReadTxAge
+	SnapshotsEvicted int64 // revoked by ExpireOldest
+	WALLimits        int64 // commits refused with WAL_LIMIT
 }
 
 type counters struct {
 	appends, syncs, groupSyncs, idSyncs, groups, intents, coalesced atomic.Int64
+
+	checkpoints, checkpointPages, scrubbed, segmentsRemoved, expired, evicted, walLimits atomic.Int64
 }
 
 // Stats returns the counters.
@@ -89,7 +103,9 @@ func (db *DB) Stats() Stats {
 	s := &db.stats
 	return Stats{Appends: s.appends.Load(), Syncs: s.syncs.Load(), CommitGroupSyncs: s.groupSyncs.Load(),
 		IDReservationSyncs: s.idSyncs.Load(), Groups: s.groups.Load(), Intents: s.intents.Load(),
-		CoalescedPages: s.coalesced.Load()}
+		CoalescedPages: s.coalesced.Load(), Checkpoints: s.checkpoints.Load(), CheckpointPages: s.checkpointPages.Load(),
+		ScrubbedPages: s.scrubbed.Load(), SegmentsRemoved: s.segmentsRemoved.Load(), SnapshotsExpired: s.expired.Load(),
+		SnapshotsEvicted: s.evicted.Load(), WALLimits: s.walLimits.Load()}
 }
 
 // Open opens the database name ("x.tacdb") in fs, creating it with
@@ -107,7 +123,7 @@ func Open(ctx context.Context, fs vfs.FS, name string, opts Options) (*DB, error
 		gov = govern.Default()
 	}
 	db := &DB{fs: fs, name: name, walDir: name + "-wal", opts: opts, segs: map[uint64]vfs.File{},
-		tokens: map[[16]byte]Status{}, queueFree: make(chan struct{}), durableCh: make(chan struct{})}
+		tokens: map[[16]byte]token{}, queueFree: make(chan struct{}), durableCh: make(chan struct{})}
 	mode := vfs.LockExclusive
 	if opts.ReadOnly {
 		mode = vfs.LockShared
@@ -154,6 +170,8 @@ func Open(ctx context.Context, fs vfs.FS, name string, opts Options) (*DB, error
 	db.ids.init(db, db.durable.Load().State.NodeHWM, db.durable.Load().State.EdgeHWM)
 	if !opts.ReadOnly {
 		db.co.start(db)
+		db.removeSegments() // leftovers below the floor, now that the state is established
+		db.mt.start(db)
 	}
 	ok = true
 	return db, nil
@@ -264,11 +282,12 @@ func (db *DB) recover(ctx context.Context) error {
 	if err := db.main.ReadAt(p1[:], page.Size); err != nil {
 		return err
 	}
-	sb, _, err := page.ChooseSuperblock(&p0, &p1)
+	sb, slot, err := page.ChooseSuperblock(&p0, &p1)
 	if err != nil {
 		return err
 	}
-	db.sb, db.uuid = sb, sb.UUID
+	db.sb, db.sbSlot, db.uuid = sb, slot, sb.UUID
+	db.walFloor.Store(sb.WALFloorSegment)
 	if ok, err := db.fs.Exists(db.walDir); err != nil {
 		return err
 	} else if !ok {
@@ -288,7 +307,7 @@ func (db *DB) recover(ctx context.Context) error {
 	checkpointed := versions.NewDirectory(base)
 	checkpointed.CommitLSN = sb.CheckpointLSN
 	dir := checkpointed
-	var tokens [][16]byte
+	var begins []wal.Begin
 	var buf page.Buf
 	for _, g := range res.Groups {
 		if err := ctx.Err(); err != nil {
@@ -312,9 +331,7 @@ func (db *DB) recover(ctx context.Context) error {
 		}
 		dir = dir.Apply(g.Commit.State, vs)
 		dir.CommitLSN = g.CommitLSN
-		for _, b := range g.Begins {
-			tokens = append(tokens, b.Token)
-		}
+		begins = append(begins, g.Begins...)
 	}
 	st := &dir.State
 	for _, r := range res.Reserves { // also those of a discarded tail: they only skip IDs
@@ -342,12 +359,17 @@ func (db *DB) recover(ctx context.Context) error {
 			return err
 		}
 		db.w = w
-		db.co.floor = sb.WALFloorSegment
-		db.co.setWALEnd(db)
+		db.co.floor.Store(int64(sb.WALFloorSegment))
+		db.co.ckLSN.Store(sb.CheckpointLSN)
+		p := w.Position()
+		db.co.seq.Store(int64(p.Seq))
+		db.co.off.Store(p.Offset)
+		db.mt.lastSeq.Store(int64(p.Seq))
+		db.mt.lastOff.Store(p.Offset)
 	}
 	if durable == dir {
-		for _, tok := range tokens {
-			db.tokens[tok] = Durable
+		for _, b := range begins {
+			db.tokens[b.Token] = token{Durable, b.CommitID}
 		}
 	}
 	db.staged.Store(dir)
@@ -392,7 +414,8 @@ func (db *DB) usable(op string) error {
 }
 
 // Close waits until the sealed commits are durable, stops the coordinator
-// and releases the files. A write transaction still open is rolled back
+// and the maintenance, runs a last checkpoint that removes the segments
+// below the new floor, and releases the files. A write transaction still open is rolled back
 // and candidates waiting for the writer get SHUTTING_DOWN. It is safe to
 // call more than once.
 func (db *DB) Close() error {
@@ -410,7 +433,13 @@ func (db *DB) Close() error {
 		if err := db.Flush(context.Background()); err != nil && !errors.Is(err, errs.Sentinel(errs.CodeRecoveryRequired)) {
 			first = err
 		}
+		db.mt.stop()
 		db.co.stop()
+		if db.failedErr.Load() == nil {
+			if err := db.maintain(context.Background()); err != nil && first == nil {
+				first = err
+			}
+		}
 		if err := db.w.Close(); err != nil && first == nil && db.failedErr.Load() == nil {
 			first = err
 		}

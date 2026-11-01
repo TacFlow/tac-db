@@ -51,12 +51,15 @@ type WriteTx struct {
 }
 
 // newWriteTx registers the writer like a snapshot, then derives from
-// stagedHead. db.mu is held.
+// stagedHead. Its floor is the durable head, at or below its base: the
+// checkpoint may only write commits that are durable. db.mu is held, so
+// stagedHead does not move.
 func (db *DB) newWriteTx() *WriteTx {
 	s := &snapshot{base: db.b.Base(), writer: true, began: db.opts.Now()}
+	s.seg.Store(db.walFloor.Load())
 	db.reg.register(s)
 	base := db.staged.Load()
-	s.commit.Store(base.State.CommitID + 1)
+	s.dir.Store(db.durable.Load())
 	gov := db.opts.Governor
 	if gov == nil {
 		gov = govern.Default()
@@ -294,7 +297,13 @@ func (tx *WriteTx) commit(ctx context.Context, wait bool) (Receipt, error) {
 	if bytes > MaxGroupBytes { // trees used directly bypass the MaxTxBytes of statements
 		return Receipt{}, errs.Newf(errs.CodeLimitExceeded, op, "the transaction changes %d pages, more than a group holds", tx.view.Dirty())
 	}
-	if err := db.reserveQueue(ctx, bytes, wait); err != nil {
+	// While the commit waits for room, the writer resolves no version: its
+	// pin is dropped, so that the pass that relieves MaxWALBytes may remove
+	// the segments it held, and taken again at the floor of now.
+	tx.snap.seg.Store(noPin)
+	err := db.reserveQueue(ctx, bytes, wait)
+	tx.snap.seg.Store(db.walFloor.Load())
+	if err != nil {
 		return Receipt{}, err // not sealed: the transaction stays active
 	}
 	in := &intent{commit: parent + 1, parent: parent, bytes: bytes, done: make(chan struct{})}
@@ -322,7 +331,7 @@ func (tx *WriteTx) commit(ctx context.Context, wait bool) (Receipt, error) {
 	tx.timer.Stop()
 	db.staged.Store(final.Dir)
 	db.queue = append(db.queue, in)
-	db.tokens[in.token] = Pending
+	db.tokens[in.token] = token{Pending, in.commit}
 	db.releaseWriterLocked(tx)
 	db.mu.Unlock()
 	db.co.signal()

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,25 +17,42 @@ import (
 
 // snapshot is a registered reader or writer (design §4.3). It registers
 // first, with a provisional floor, the base T in force; then it loads its
-// head and records the CommitID. A checkpointer loads durableHead first
-// and then scans the registry: a registration the scan missed happened
-// after it, and the head that reader loads is at or beyond the durable
-// head the checkpointer read.
+// head. A checkpointer loads
+// durableHead first and then scans the registry: a registration the scan
+// missed happened after it, and the head that reader loads is at or
+// beyond the durable head the checkpointer read.
+//
+// A version resolved to the log before a checkpoint publishes a new base
+// may be read after it, so a snapshot pins the log floor in force while
+// it can resolve: a reader during each operation, a writer for its life.
+// An idle reader pins nothing beyond what its floor commit keeps.
 type snapshot struct {
-	base   uint64        // the base T when it registered: the provisional floor
-	commit atomic.Uint64 // CommitID+1 of its head; zero while provisional
-	writer bool          // a writer does not count for MaxReadTxAge
+	base   uint64                             // the base T when it registered: the provisional floor
+	seg    atomic.Uint64                      // the log floor segment it pins; noPin when idle
+	dir    atomic.Pointer[versions.Directory] // its floor once loaded; nil while provisional
+	writer bool                               // a writer is never revoked: MaxWriteTxDuration bounds it
 	began  time.Time
 	shard  int
+
+	// Revocation is cooperative (SPEC §10.1): a revoked snapshot fails its
+	// next operation, and leaves the registry once the operation in
+	// progress ends.
+	mu      sync.Mutex
+	ops     int
+	revoked bool
+	gone    bool // removed from the registry
 }
 
 // floor is the oldest commit the snapshot may read through.
 func (s *snapshot) floor() uint64 {
-	if c := s.commit.Load(); c != 0 {
-		return c - 1
+	if d := s.dir.Load(); d != nil {
+		return d.State.CommitID
 	}
 	return s.base
 }
+
+// noPin is the seg of a snapshot that pins no segment.
+const noPin = math.MaxUint64
 
 const regShards = 16
 
@@ -67,32 +85,94 @@ func (r *registry) remove(s *snapshot) {
 	sh.mu.Unlock()
 }
 
-// oldest returns the lowest floor among the registered snapshots.
-func (r *registry) oldest() (uint64, bool) {
-	var m uint64
-	found := false
+// all returns the registered snapshots.
+func (r *registry) all() []*snapshot {
+	var out []*snapshot
 	for i := range r.shards {
 		sh := &r.shards[i]
 		sh.mu.Lock()
 		for s := range sh.m {
-			if f := s.floor(); !found || f < m {
-				m, found = f, true
-			}
+			out = append(out, s)
 		}
 		sh.mu.Unlock()
 	}
-	return m, found
+	return out
 }
 
-// checkpointTarget is the commit a checkpoint may write (SPEC §11.1):
-// the durable head, or the oldest snapshot if older. The durable head is
-// loaded before the registry is scanned.
-func (db *DB) checkpointTarget() uint64 {
-	t := db.durable.Load().State.CommitID
-	if o, ok := db.reg.oldest(); ok {
-		t = min(t, o)
+// leave removes s from the registry once. s.mu is held.
+func (s *snapshot) leaveLocked(r *registry) {
+	if !s.gone {
+		s.gone = true
+		r.remove(s)
 	}
-	return t
+}
+
+// enterOp starts an operation of the snapshot, unless it was revoked. The
+// outermost operation (a callback may nest another) pins floor before any
+// version is resolved.
+func (s *snapshot) enterOp(op string, floor func() uint64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revoked {
+		return errs.New(errs.CodeSnapshotExpired, op, "the snapshot was revoked")
+	}
+	if s.ops == 0 {
+		s.seg.Store(floor())
+	}
+	s.ops++
+	return nil
+}
+
+// exitOp ends an operation. The outermost one unpins, and a snapshot
+// revoked meanwhile leaves now.
+func (s *snapshot) exitOp(r *registry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ops--; s.ops == 0 {
+		s.seg.Store(noPin)
+		if s.revoked {
+			s.leaveLocked(r)
+		}
+	}
+}
+
+// revoke marks s revoked and reports whether it was live. It leaves the
+// registry at once if no operation is in progress.
+func (s *snapshot) revoke(r *registry) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.revoked || s.gone {
+		return false
+	}
+	s.revoked = true
+	if s.ops == 0 {
+		s.leaveLocked(r)
+	}
+	return true
+}
+
+// target is the commit a checkpoint may write (SPEC §11.1): the durable
+// head, or the oldest snapshot if older. The durable head is loaded
+// before the registry is scanned. dir is nil when the target is a
+// provisional floor, the base itself: there is nothing to write then.
+func (db *DB) target() (commit uint64, dir *versions.Directory) {
+	dir = db.durable.Load()
+	commit = dir.State.CommitID
+	for _, s := range db.reg.all() {
+		if f := s.floor(); f < commit {
+			commit, dir = f, s.dir.Load()
+			if dir == nil || dir.State.CommitID != f { // provisional, or loaded meanwhile
+				dir = nil
+			}
+		}
+	}
+	return commit, dir
+}
+
+// checkpointTarget returns the commit of target.
+func (db *DB) checkpointTarget() uint64 {
+	c, _ := db.target()
+	return c
 }
 
 // enter counts a new transaction against MaxActiveTransactions.
@@ -143,21 +223,30 @@ func (db *DB) beginRead(ctx context.Context, head *atomic.Pointer[versions.Direc
 		return nil, err
 	}
 	s := &snapshot{base: db.b.Base(), began: db.opts.Now()}
+	s.seg.Store(noPin)
 	db.reg.register(s)
 	if h := db.hooks.afterRegister; h != nil {
 		h()
 	}
 	d := head.Load()
-	s.commit.Store(d.State.CommitID + 1)
+	s.dir.Store(d)
 	return &ReadTx{db: db, snap: s, dir: d, view: db.b.Snapshot(d), pins: cache.NewPins(0),
 		durable: d.State.CommitID <= db.durable.Load().State.CommitID}, nil
 }
 
-func (t *ReadTx) check(op string) error {
+// begin starts an operation: the transaction is open, the snapshot not
+// revoked and not older than MaxReadTxAge. The caller ends it with
+// t.snap.exitOp.
+func (t *ReadTx) begin(op string) error {
 	if t.closed {
 		return errs.New(errs.CodeTxClosed, op, "transaction closed")
 	}
-	return nil
+	if age := t.db.opts.Now().Sub(t.snap.began); age > t.db.opts.MaxReadTxAge {
+		for _, ev := range t.db.revoke([]*snapshot{t.snap}, EventSnapshotExpired, nil) {
+			t.db.emit(ev)
+		}
+	}
+	return t.snap.enterOp(op, t.db.walFloor.Load)
 }
 
 // State returns the state of the snapshot.
@@ -168,24 +257,26 @@ func (t *ReadTx) Durable() bool { return t.durable }
 
 // Get reads key in the tree of root slot.
 func (t *ReadTx) Get(ctx context.Context, slot int, key []byte) ([]byte, bool, error) {
-	if err := t.check("engine.Get"); err != nil {
-		return nil, false, err
-	}
 	if err := checkSlot(slot); err != nil {
 		return nil, false, err
 	}
+	if err := t.begin("engine.Get"); err != nil {
+		return nil, false, err
+	}
+	defer t.snap.exitOp(&t.db.reg)
 	return btree.Get(ctx, t.view, t.pins, t.dir.State.Roots[slot], key)
 }
 
 // Range calls fn for the keys in [lo, hi) of the tree of root slot; nil
 // bounds are open.
 func (t *ReadTx) Range(ctx context.Context, slot int, lo, hi []byte, fn func(k, v []byte) error) error {
-	if err := t.check("engine.Range"); err != nil {
-		return err
-	}
 	if err := checkSlot(slot); err != nil {
 		return err
 	}
+	if err := t.begin("engine.Range"); err != nil {
+		return err
+	}
+	defer t.snap.exitOp(&t.db.reg)
 	return btree.Range(ctx, t.view, t.pins, t.dir.State.Roots[slot], lo, hi, fn)
 }
 
@@ -193,7 +284,9 @@ func (t *ReadTx) Range(ctx context.Context, slot int, lo, hi []byte, fn func(k, 
 func (t *ReadTx) Close() error {
 	if !t.closed {
 		t.closed = true
-		t.db.reg.remove(t.snap)
+		t.snap.mu.Lock()
+		t.snap.leaveLocked(&t.db.reg)
+		t.snap.mu.Unlock()
 		t.db.active.Add(-1)
 	}
 	return nil

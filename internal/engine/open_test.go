@@ -137,8 +137,8 @@ func TestCreateReopenAndReadOnly(t *testing.T) {
 	if got := read(t, db); got["a"] != "1" || got["b"] != "2" || len(got) != 2 {
 		t.Fatalf("after reopen: %v", got)
 	}
-	if db.CommitStatus(r.Token) != Durable {
-		t.Fatal("the token history is seeded from the log")
+	if db.CommitStatus(r.Token) != Unknown {
+		t.Fatal("the last checkpoint of Close forgets the tokens it covers")
 	}
 	structural(t, db)
 	db.Close()
