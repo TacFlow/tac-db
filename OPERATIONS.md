@@ -36,3 +36,34 @@ The cache keeps verified page images and evicts with a CLOCK (second chance) in 
 ### 2.1 Durability on macOS
 
 tacdb flushes files and directories with `F_FULLFSYNC`, because plain `fsync` does not make macOS write its caches to the medium. Keep databases on APFS or HFS+, which implement it. When `F_FULLFSYNC` fails on a file or a directory, as on network file systems that do not implement it, tacdb falls back to plain `fsync` and counts the fallback. On such file systems recent writes and renames may not survive a power loss. The counter is internal for now; it becomes visible with the metrics of a later milestone.
+
+## 3. Transactions and durability
+
+### 3.1 Durability modes
+
+The mode is chosen per handle and applies to every commit.
+
+| Mode | A commit returns | After a power loss |
+|---|---|---|
+| `GroupSync` (default) | once its group is synced, with `Durable=true` | every returned commit survives |
+| `Sync` | once it is synced as its own group, with `Durable=true` | every returned commit survives |
+| `Async` | once it is appended and published, with `Durable=false` | a suffix of returned commits may be lost; what survives is always a prefix |
+
+`GroupSync` is adaptive: a commit alone pays one Sync and waits for no window, and commits that seal while a Sync runs share the next one (up to 64 commits or 8 MiB per group). `Async` syncs every 100 ms, after 16 MiB of appends, on `Flush`, or as soon as a commit waits for room in the commit queue. `Flush` waits until every commit sealed before the call is durable. Readers that must only see durable data use `BeginReadDurable`.
+
+### 3.2 Admission and limits
+
+One writer holds the writer slot at a time. `BeginWrite` waits in a FIFO queue of 128 candidates for at most `BusyTimeout` (5 s); `TryBeginWrite` never waits. The errors are distinct: `DB_BUSY` (the slot is taken and the caller would not wait), `WRITER_QUEUE_FULL`, `BUSY_TIMEOUT`, `CANCELED` and `DEADLINE`. At most `MaxActiveTransactions` (1024) read and write transactions are open; one more gets `TOO_MANY_TRANSACTIONS`. A write transaction older than `MaxWriteTxDuration` (30 s) is rolled back and its next call gets `WRITE_TX_TIMEOUT`; commits it already sealed are not affected. A transaction holds at most `MaxTxBytes` (64 MiB) of private pages; the statement that passes it fails alone. A group must fit one log segment, so `GroupMaxBytes` may not exceed 128 MiB nor `MaxTxBytes` 64 MiB, and `AsyncSyncBytes` may not exceed `MaxPendingCommitBytes`.
+
+Commits sealed and not yet durable are bounded by `MaxPendingCommits` (256) and `MaxPendingCommitBytes` (128 MiB). `Commit` waits for room under the caller's deadline; `TryCommit` gets `COMMIT_QUEUE_FULL` at once. A commit that would take the log past `MaxWALBytes` (1 GiB) gets `WAL_LIMIT`. In all these cases the transaction is not sealed and stays usable.
+
+### 3.3 Pending commits and failures
+
+A commit is sealed once its writer releases the slot; from then on it cannot be rolled back, because the next writer builds on it. Canceling the wait of a sealed commit returns `COMMIT_PENDING` with the commit's token; the commit still completes. `CommitStatus(token)` says `Pending`, `Volatile` (appended in `Async`), `Durable` or `Unknown`. Tokens of commits recovered from the log are known after a reopen; a token never seen, or lost in a failure, is `Unknown`, and the application then checks its own idempotency key. Never repeat a mutation automatically.
+
+When an append or a Sync of the log fails, the handle becomes `RECOVERY_REQUIRED`: pending commits get `COMMIT_UNKNOWN`, a writer that built on them cannot commit, and no transaction begins. The failed Sync is never retried, since the operating system's cache is then in an unknown state. Close the handle and open the database again: recovery decides which commits survived, and a `COMMIT_UNKNOWN` commit may turn out to be complete.
+
+### 3.4 Read-only opening
+
+A read-only open never changes a file. It recovers the log in memory and tries to make what it read durable with a Sync of a read-only handle. Where the platform refuses that, the recovered commits past the last checkpoint are served but not reported durable, and `BeginReadDurable` gives the checkpointed state.
+

@@ -43,7 +43,7 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | REV-23 | MERGE without an index cost O(N) per call | M3/M7 | pending | — |
 | REV-24 | Plan cache polluted by literals | M4 | pending | — |
 | REV-25 | A per-statement savepoint could copy the overlay | M2 | pending | — |
-| REV-26 | Contention on the RWMutex, the snapshot registry and global LRUs | M2 | partial | M1d: CLOCK with second chance in shards for the page cache; RWMutex and snapshot registry in M2 |
+| REV-26 | Contention on the RWMutex, the snapshot registry and global LRUs | M2 | partial | M1d: CLOCK with second chance in shards for the page cache; M2c: heads behind atomic pointers and a registry in 16 shards, so Begin and the end of a read take no global lock; the concurrency benchmark in M2e |
 | REV-27 | The catalog mixed declarations and hot counters; ambiguous schemaEpoch | M3 | pending | — |
 | REV-28 | A cluster receipt required two fsyncs in series | M11 | pending | — |
 | REV-29 | Bundles of up to 65 MiB went through Raft | M11 | pending | — |
@@ -74,7 +74,7 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | R13-06 | The changefeed was on by default with no automatic retention and grew without bound | M6 | pending | — |
 | R13-07 | Imported changefeed payloads mixed the R0 format with G2 in the same stream | M9 | pending | — |
 | R13-08 | `result.<node>` inverted the TAC convention `<node>.result`; rows were positional only | M7 | pending | — |
-| R13-09 | An orphan WAL from an interrupted creation blocked `Open(Create)` | M2 | pending | — |
+| R13-09 | An orphan WAL from an interrupted creation blocked `Open(Create)` | M2 | done | M2c: `internal/engine` replaces only a log with segment 1 and no record; any other is refused (REC-12, `TestOrphanLog`) |
 | R13-10 | Go 1.27.2 already superseded by a fix release | M1 | done | M1a: `go.mod` pins `toolchain go1.27.3`; first green CI run on go1.27.3 (CI run 41250873068) |
 | R13-11 | Inconsistent names: the dictionary scan metric had two names; `compatibility.md` | M0 | done | SPEC 1.3 (§2 and §13.3) |
 | R13-12 | `created_unix_ns` prevented byte-for-byte binary goldens | M2 | done | M2a: injectable clock in `internal/wal`; golden segment header and records (`TestGoldenRecords`) |
@@ -87,5 +87,5 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | R13-19 | The canonical form with a prefix could be larger than the page without one, and fit decisions based on a private copy's layout failed at finalization | M1 | done | M1c: canonical prefix and size (`TestCanonicalSizeIsMinimal`); M1e: every fit decision on the canonical size of the resulting set (`TestFitsOnlyWithTheNewPrefix`) and a finalization that checks the canonical form (`TestCommitRefusesNonCanonicalPages`) |
 | R13-20 | A superblock copy from a future revision could be classified as damaged and silently reopen the older copy | M1 | done | M1c: `Classify` and `ChooseSuperblock` (`TestClassify`, `TestChooseSuperblock`) |
 | R13-21 | Windows permissions without an owner check, macOS extended ACLs ignored, Windows junctions outside the symlink rule, path-based checks and inheritable ACEs ignored | M1 | partial | M1b: `internal/vfs`; green on Linux, macOS and Windows (CI run 41250873068), but the junction case skips when `mklink /J` fails; the CI now fails on that skip, and the next run closes it (SEC-08) |
-| R13-22 | Write cursors survived a savepoint restore, and a counter restored with the savepoint allowed ABA | M1/M2 | partial | M1e: per-tree mutation counters and the restore counter of the transaction, both monotonic (`TestCursorInvalidation`); M2b: the overlay of `internal/versions` restores in O(1) and counts restores (`TestRollbackTo`, `TestStatementSavepoints`); the transactions of M2c |
+| R13-22 | Write cursors survived a savepoint restore, and a counter restored with the savepoint allowed ABA | M1/M2 | done | M1e: per-tree mutation counters and the restore counter of the transaction, both monotonic (`TestCursorInvalidation`); M2b: the overlay of `internal/versions` restores in O(1) and counts restores (`TestRollbackTo`, `TestStatementSavepoints`); M2c: transactions restore the roots of every open tree, including trees opened after the savepoint (`TestRollbackAndStatements`) |
 | R13-23 | The tail rule of §11.2 turned an ordinary power loss into CORRUPT when an unsynced append reached the disk out of order, or would drop an acknowledged commit corrupted after its Sync | M2 | partial | M2a: `durable_lsn` in BEGIN, segment roll through `spare.tmp`, new segment after a discarded tail, evidence-based tail classification (`TestTornTailIsDiscarded`, `TestCorruptionAfterSync`, `TestDiscardedTailDoesNotResurrect`); the crash matrix in M2e |

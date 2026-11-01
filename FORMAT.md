@@ -270,3 +270,10 @@ A group is its BEGINs, in the order of the chain of intents, then one PAGE per P
 5. A defect in the last segment — an invalid record, an incomplete group, a broken chain, or a zero magic followed by data — at the end P of the last complete unit is classified by evidence. An unsynced append may reach the disk in any order, so a later record can be intact while an earlier one is not. The rest of the segment is searched, at 8-byte boundaries, for plausible records — fixed header fields, an LSN at or after the one at P and within what the segment can hold, and the payload length of a BEGIN or a RESERVE_IDS, all checked before the CRC — whose CRC is valid. If any BEGIN among them declares a `durable_lsn` at or beyond the LSN at P, the region had been synced and the log is `CORRUPT`; otherwise the tail is discarded. RESERVE_IDS records with a valid CRC in a discarded tail are still applied, which only skips identifiers.
 
 The last synced group has no later evidence: if it is corrupted on the medium after its Sync and nothing newer survives, it is discarded as a tail. This residual risk is accepted (R13-23).
+
+### 12.5 Creating a database
+
+A new database first gets its log: the directory `name.tacdb-wal/` with segment 1 synced, then the directory and its parent synced. Then the main file is written as a temporary, `name.tacdb.<16 hex digits>.tmp`, with the initial superblock in page 0 (generation 1, all roots zero, `pageCount=2`, CommitID and `checkpoint_lsn` zero, `wal_floor_segment=1`) and page 1 zero; it is synced, renamed to `name.tacdb`, and the directory is synced. A published main file therefore always has its log.
+
+A creation that crashes before the rename leaves a log without a main file. Creating the database again replaces that log only if it holds nothing but segment 1 (and possibly `spare.tmp`), with a valid header and no record: the state only an interrupted creation produces. Any other log without a main file is refused with `DESTINATION_EXISTS`, and a main file without its log is `RECOVERY_REQUIRED`. Temporaries left by an interrupted creation are not removed.
+
