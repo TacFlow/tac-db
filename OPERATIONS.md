@@ -1,6 +1,6 @@
 # Operations
 
-This document explains how to run tacdb in production: memory, files and, in later milestones, checkpoints, backups and the cluster. It grows with each milestone; this version covers memory and the durability of files on macOS.
+This document explains how to run tacdb in production: memory, files, transactions, checkpoints and, in later milestones, backups and the cluster. It grows with each milestone.
 
 ## 1. Memory
 
@@ -36,3 +36,59 @@ The cache keeps verified page images and evicts with a CLOCK (second chance) in 
 ### 2.1 Durability on macOS
 
 tacdb flushes files and directories with `F_FULLFSYNC`, because plain `fsync` does not make macOS write its caches to the medium. Keep databases on APFS or HFS+, which implement it. When `F_FULLFSYNC` fails on a file or a directory, as on network file systems that do not implement it, tacdb falls back to plain `fsync` and counts the fallback. On such file systems recent writes and renames may not survive a power loss. The counter is internal for now; it becomes visible with the metrics of a later milestone.
+
+## 3. Transactions and durability
+
+### 3.1 Durability modes
+
+The mode is chosen per handle and applies to every commit.
+
+| Mode | A commit returns | After a power loss |
+|---|---|---|
+| `GroupSync` (default) | once its group is synced, with `Durable=true` | every returned commit survives |
+| `Sync` | once it is synced as its own group, with `Durable=true` | every returned commit survives |
+| `Async` | once it is appended and published, with `Durable=false` | a suffix of returned commits may be lost; what survives is always a prefix |
+
+`GroupSync` is adaptive: a commit alone pays one Sync and waits for no window, and commits that seal while a Sync runs share the next one (up to 64 commits or 8 MiB per group). `Async` syncs every 100 ms, after 16 MiB of appends, on `Flush`, or as soon as a commit waits for room in the commit queue. `Flush` waits until every commit sealed before the call is durable. Readers that must only see durable data use `BeginReadDurable`.
+
+### 3.2 Admission and limits
+
+One writer holds the writer slot at a time. `BeginWrite` waits in a FIFO queue of 128 candidates for at most `BusyTimeout` (5 s); `TryBeginWrite` never waits. The errors are distinct: `DB_BUSY` (the slot is taken and the caller would not wait), `WRITER_QUEUE_FULL`, `BUSY_TIMEOUT`, `CANCELED` and `DEADLINE`. At most `MaxActiveTransactions` (1024) read and write transactions are open; one more gets `TOO_MANY_TRANSACTIONS`. A write transaction older than `MaxWriteTxDuration` (30 s) is rolled back and its next call gets `WRITE_TX_TIMEOUT`; commits it already sealed are not affected. A transaction holds at most `MaxTxBytes` (64 MiB) of private pages; the statement that passes it fails alone. A group must fit one log segment, so `GroupMaxBytes` may not exceed 128 MiB nor `MaxTxBytes` 64 MiB, and `AsyncSyncBytes` may not exceed `MaxPendingCommitBytes`.
+
+Commits sealed and not yet durable are bounded by `MaxPendingCommits` (256) and `MaxPendingCommitBytes` (128 MiB). `Commit` waits for room under the caller's deadline; `TryCommit` gets `COMMIT_QUEUE_FULL` at once. A commit that would take the log past `MaxWALBytes` (1 GiB) first runs the snapshot pressure policy and a checkpoint (§4.2), then gets `WAL_LIMIT` if the log is still too large; `TryCommit` gets it at once. In all these cases the transaction is not sealed and stays usable.
+
+### 3.3 Pending commits and failures
+
+A commit is sealed once its writer releases the slot; from then on it cannot be rolled back, because the next writer builds on it. Canceling the wait of a sealed commit returns `COMMIT_PENDING` with the commit's token; the commit still completes. `CommitStatus(token)` says `Pending`, `Volatile` (appended in `Async`), `Durable` or `Unknown`. Tokens of commits recovered from the log are known after a reopen. A checkpoint forgets the tokens of the commits it copied, and `Close` ends with a checkpoint; a token never seen, forgotten or lost in a failure is `Unknown`, and the application then checks its own idempotency key. Never repeat a mutation automatically.
+
+When an append or a Sync of the log fails, the handle becomes `RECOVERY_REQUIRED`: pending commits get `COMMIT_UNKNOWN`, a writer that built on them cannot commit, and no transaction begins. The failed Sync is never retried, since the operating system's cache is then in an unknown state. Close the handle and open the database again: recovery decides which commits survived, and a `COMMIT_UNKNOWN` commit may turn out to be complete.
+
+### 3.4 Read-only opening
+
+A read-only open never changes a file. It recovers the log in memory and tries to make what it read durable with a Sync of a read-only handle. Where the platform refuses that, the recovered commits past the last checkpoint are served but not reported durable, and `BeginReadDurable` gives the checkpointed state.
+
+## 4. Checkpoints and the log
+
+### 4.1 The passive checkpoint
+
+A maintenance goroutine per handle copies durable commits from the log to the main file and removes the log segments it no longer needs. It runs after every 64 MiB of log (`CheckpointBytes`), when more than four segments lie above the floor (`CheckpointSegments`), when a commit reaches `MaxWALBytes`, and on `Checkpoint(ctx)`. `Close` runs a last checkpoint, so a database closed cleanly keeps one segment. The checkpoint never blocks `BeginRead`, `BeginWrite`, readers, commits or the log's Syncs: it writes up to the oldest snapshot, and the snapshots newer than that keep reading their versions from the log.
+
+With `ScrubFreedPages` (on by default), the checkpoint also overwrites freed pages with zeroed free pages, so deleted data does not linger in the main file.
+
+A failure to write or sync the main file during a checkpoint makes the handle `RECOVERY_REQUIRED`, like a failure of the log (§3.3): the Sync is never retried. The log still holds everything, and the next open recovers from it.
+
+### 4.2 Old snapshots
+
+A snapshot keeps every log segment written after it. Two limits stop a forgotten one from pinning the log:
+
+| Option | Default | Effect |
+|---|---|---|
+| `MaxReadTxAge` | 10 min | A read transaction older than this is revoked. `Unlimited` disables it. |
+| `SnapshotPressurePolicy` | `ExpireOldest` | What happens when snapshots pin `WALPinnedSoftBytes` of log. |
+| `WALPinnedSoftBytes` | 512 MiB | The log pinned by snapshots that starts the policy. |
+| `MinSnapshotAgeForEviction` | 30 s | `ExpireOldest` never revokes a younger snapshot. |
+
+Revocation is cooperative: an operation already running finishes and delivers all its results; the next one gets `SNAPSHOT_EXPIRED`. Close the transaction and begin a new one. `ExpireOldest` revokes from the oldest snapshot on, and only when that frees segments: it never revokes a snapshot that shares its floor with one too young to revoke. `RejectWrites` keeps every reader; commits then fail with `WAL_LIMIT` once the log reaches `MaxWALBytes`, and the error names how many snapshots keep the log and the age and origin of the oldest. Write transactions are never revoked; `MaxWriteTxDuration` bounds them.
+
+Each revocation and each refused commit calls `OnEvent` with the kind of event, the number of snapshots, the age and origin of the oldest and the log they pin. The callback runs on the goroutine that found the event (maintenance, a commit or a reader), with no lock of the handle held, and must not block. `Stats` counts checkpoints, copied and scrubbed pages, removed segments, revoked snapshots and `WAL_LIMIT` refusals.
+

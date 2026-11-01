@@ -522,3 +522,104 @@ func TestConcurrentUse(t *testing.T) {
 		t.Fatalf("budget exceeded: %+v", s)
 	}
 }
+
+// Invalidate drops a page: the next Get loads it again. A handle held
+// across the invalidation keeps its buffer, and evicting the old entry
+// never removes the new one.
+func TestInvalidate(t *testing.T) {
+	c := newCache(t, MinPages, 1, nil)
+	pins := NewPins(0)
+	var calls atomic.Int64
+	h, err := c.Get(context.Background(), pins, key(1), loader(&calls, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	h.Release()
+	c.Invalidate(key(1))
+	if s := c.Stats(); s.Bytes != 0 {
+		t.Fatalf("an unpinned invalidated page kept %d bytes", s.Bytes)
+	}
+	held := get(t, c, pins, 1)
+	c.Invalidate(key(1)) // pinned: only the mapping goes
+	if s := c.Stats(); s.Bytes != EntryCost {
+		t.Fatalf("a pinned invalidated page must stay counted: %d bytes", s.Bytes)
+	}
+	fresh, err := c.Get(context.Background(), pins, key(1), loader(&calls, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls.Load() != 2 || fresh.Bytes() == held.Bytes() {
+		t.Fatalf("loads %d; the new entry shares the old buffer: %v", calls.Load(), fresh.Bytes() == held.Bytes())
+	}
+	held.Release()
+	fresh.Release()
+	// Evicting the old entry, still in the CLOCK list, must leave the new
+	// one mapped.
+	for p := uint64(2); p < MinPages; p++ {
+		get(t, c, pins, p).Release()
+	}
+	if !cached(c, 1) {
+		t.Fatal("evicting the invalidated entry removed its successor")
+	}
+	for p := uint64(100); p <= 100+MinPages; p++ { // evict everything
+		get(t, c, pins, p).Release()
+	}
+	if s := c.Stats(); s.Bytes > MinPages*EntryCost {
+		t.Fatalf("budget exceeded: %+v", s)
+	}
+	c.Invalidate(key(999)) // absent: nothing to do
+}
+
+// A page invalidated while it loads is handed to its caller but not
+// cached, and its room goes back.
+func TestInvalidateWhileLoading(t *testing.T) {
+	c := newCache(t, MinPages, 1, nil)
+	release := make(chan struct{})
+	done := make(chan *Handle, 1)
+	go func() {
+		h, err := c.Get(context.Background(), NewPins(0), key(5), func(_ context.Context, dst *page.Buf) error {
+			<-release
+			return nil
+		})
+		if err != nil {
+			t.Error(err)
+		}
+		done <- h
+	}()
+	eventually(t, func() bool { return c.Stats().Misses == 1 })
+	c.Invalidate(key(5))
+	close(release)
+	h := <-done
+	h.Release()
+	if cached(c, 5) || c.Stats().Bytes != 0 {
+		t.Fatalf("invalidated while loading: cached %v, %d bytes", cached(c, 5), c.Stats().Bytes)
+	}
+}
+
+// Invalidating the entry under the CLOCK hand moves the hand: the list
+// stays whole and later pages are cached normally.
+func TestInvalidateUnderTheHand(t *testing.T) {
+	c := newCache(t, MinPages, 1, nil)
+	pins := NewPins(0)
+	for p := uint64(1); p <= MinPages; p++ {
+		get(t, c, pins, p).Release()
+	}
+	sh := c.shards[0]
+	sh.mu.Lock()
+	under := sh.hand.key
+	sh.mu.Unlock()
+	c.Invalidate(under)
+	for p := uint64(100); p < 100+3*MinPages; p++ {
+		get(t, c, pins, p).Release()
+	}
+	sh.mu.Lock()
+	n, walked := sh.n, 0
+	for e := sh.hand; walked < n+1; e = e.next {
+		if e == nil || e.next.prev != e {
+			sh.mu.Unlock()
+			t.Fatalf("the CLOCK list is broken after %d entries", walked)
+		}
+		walked++
+	}
+	sh.mu.Unlock()
+}

@@ -337,6 +337,29 @@ func (r *Reservation) Close() {
 	}
 }
 
+// Transfer moves the bytes held to a new reservation of category c and
+// closes r. The same memory changes owner, so nothing is counted twice and
+// nothing waits: a commit hands the overlay of its transaction to the
+// sealed images (SPEC §9.2). Transferring a closed reservation gives an
+// empty one.
+func (r *Reservation) Transfer(c Category) *Reservation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	n := &Reservation{g: r.g, cat: c}
+	if r.closed || r.bytes == 0 {
+		r.closed = true
+		return n
+	}
+	r.g.mu.Lock()
+	r.g.used[r.cat] -= r.bytes
+	r.g.used[c] += r.bytes
+	close(r.g.changed) // the old category may have room now
+	r.g.changed = make(chan struct{})
+	r.g.mu.Unlock()
+	n.bytes, r.bytes, r.closed = r.bytes, 0, true
+	return n
+}
+
 // Budget charges value decoding to a Reservation (the Budget of
 // internal/codec, SPEC §5.3), with the waiting rules of Reserve.
 type Budget struct {
