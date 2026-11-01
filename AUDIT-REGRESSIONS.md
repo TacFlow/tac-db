@@ -18,11 +18,11 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | AUD-12 | Reported Recall@10 of 54% with 20k; ef not tunable from Cypher | wave 1/3 | pending | — |
 | AUD-13 | Vector inserts dropped from 180/s to 127/s between 5k and 20k | wave 2/3 | pending | — |
 | AUD-14 | >~2500 unique terms send update/delete to a global scan; warning only on stderr | wave 1/3 | pending | — |
-| REV-01 | A quiescent checkpoint never runs under continuous reads; the WAL hits its cap and writes fail; read replicas stop applying | M2 | pending | — |
-| REV-02 | Checkpoint blocked new Begins while copying and syncing | M2 | pending | — |
+| REV-01 | A quiescent checkpoint never runs under continuous reads; the WAL hits its cap and writes fail; read replicas stop applying | M2 | done | M2d: passive checkpoint up to the oldest snapshot in `internal/engine`, segments removed below the floor (OPS-04: `TestCheckpointUnderLoad`; REC-04: `TestCheckpointCrashPoints`, `TestCheckpointFloorMidSegment`); REC-10 in M2a |
+| REV-02 | Checkpoint blocked new Begins while copying and syncing | M2 | partial | M2d: the checkpoint takes no admission lock and runs beside readers and writers (`TestCheckpointUnderLoad`, `TestCheckpointConcurrentReaders`); gate 10 of §26.2 measured in M2e |
 | REV-03 | Backup and Serialize blocked the database for the whole copy | M9 | pending | — |
 | REV-04 | A Raft snapshot paused apply; on the leader it froze receipts | M11 | pending | — |
-| REV-05 | A forgotten snapshot pinned WAL and memory indefinitely | M2 | pending | — |
+| REV-05 | A forgotten snapshot pinned WAL and memory indefinitely | M2 | done | M2d: `MaxReadTxAge` with cooperative revocation and both pressure policies, with diagnostic events (OPS-05: `TestReadTxAge`, `TestCooperativeRevocation`, `TestPressureExpireOldest`, `TestPressureRejectWrites`) |
 | REV-06 | Hot pages were re-emitted by every intent of a group | M2 | pending | — |
 | REV-07 | A fixed 2 ms window penalized an isolated commit | M2 | pending | — |
 | REV-08 | One dedicated Sync for every 1024 IDs | M2 | pending | — |
@@ -38,7 +38,7 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | REV-18 | Metadata and properties in distant regions of the tree | M3 | pending | — |
 | REV-19 | Low fanout with long keys; wide slots | M1 | done | M1c: prefix compression, 4-byte slots and uvarints in `internal/page`; M1e: truncated separators in `internal/btree` and BT-03 (`TestAgainstModel` with long common prefixes; `TestSeparatorsAreTruncated`, where full separators would need a third level; `TestVerifyRejectsBadSeparators`) |
 | REV-20 | Chained overflow without readahead; large values polluted the cache | M1 | done | M1c: extents in the page format; M1e: one sequential `ReadOverflow` per extent (BT-04, `TestLargeValues`, `TestForgedDescriptorExtents`); M2b: the production page reader in `internal/versions` reads extents above `LargeValueBypassBytes` without the cache (`TestLargeValueBypass`) |
-| REV-21 | A LIFO freelist scattered pages and defeated compact | M1 | partial | M1e: bitmap groups in `internal/alloc`, lowest address first, with a locality hint (BT-05 without scrub: `TestLowestAddressFirst`, `TestRandomAllocFreeWithReopen`); scrub in M2 |
+| REV-21 | A LIFO freelist scattered pages and defeated compact | M1 | done | M1e: bitmap groups in `internal/alloc`, lowest address first, with a locality hint (BT-05 without scrub: `TestLowestAddressFirst`, `TestRandomAllocFreeWithReopen`); M2d: the checkpoint scrubs freed pages, also after an interrupted checkpoint (`TestScrub`, `TestScrubAfterInterruptedCheckpoint`) |
 | REV-22 | Long strings lost range and prefix scans in the index | M3 | pending | — |
 | REV-23 | MERGE without an index cost O(N) per call | M3/M7 | pending | — |
 | REV-24 | Plan cache polluted by literals | M4 | pending | — |

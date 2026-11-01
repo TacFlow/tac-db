@@ -221,7 +221,7 @@ A segment has a 4096-byte header, followed by records. It is created at its targ
 
 **After recovery.** When recovery discarded a tail (§12.4), the next writer starts a new segment whose `prev_valid_end` marks the end of the recovered prefix; the bytes after it are never read again, so a discarded tail cannot come back under reused LSNs. Otherwise appends continue in the last segment, after its last valid record.
 
-**Floor.** `wal_floor_segment` in the superblock is the segment after the one holding `checkpoint_lsn` if that segment already has its final name, else the segment holding `checkpoint_lsn`; records up to `checkpoint_lsn` are skipped.
+**Floor.** `wal_floor_segment` in the superblock is the segment that holds the record `checkpoint_lsn + 1`, or the last segment when that record is not written yet; records up to `checkpoint_lsn` are skipped. When the COMMIT at `checkpoint_lsn` is the last record of its segment and the next segment exists, the floor is that next segment; when more records follow the COMMIT in its segment, the floor stays there, so that recovery reads them.
 
 ### 12.2 Records
 
@@ -276,4 +276,15 @@ The last synced group has no later evidence: if it is corrupted on the medium af
 A new database first gets its log: the directory `name.tacdb-wal/` with segment 1 synced, then the directory and its parent synced. Then the main file is written as a temporary, `name.tacdb.<16 hex digits>.tmp`, with the initial superblock in page 0 (generation 1, all roots zero, `pageCount=2`, CommitID and `checkpoint_lsn` zero, `wal_floor_segment=1`) and page 1 zero; it is synced, renamed to `name.tacdb`, and the directory is synced. A published main file therefore always has its log.
 
 A creation that crashes before the rename leaves a log without a main file. Creating the database again replaces that log only if it holds nothing but segment 1 (and possibly `spare.tmp`), with a valid header and no record: the state only an interrupted creation produces. Any other log without a main file is refused with `DESTINATION_EXISTS`, and a main file without its log is `RECOVERY_REQUIRED`. Temporaries left by an interrupted creation are not removed.
+
+### 12.6 Checkpoint
+
+A checkpoint copies to the main file the state of a target commit T: the durable head, or the oldest snapshot if older. Every live snapshot reads at or after T, so none of them reads the pages it rewrites from the main file.
+
+1. Before any write, it computes what to write: every page with a version in the log newer than the CommitID of the superblock and at most T, except the pages free in T; and, with the scrub, the pages free in T that are allocated in the bitmap of the main file or have such a version. The scrub writes them as free pages (§8). A bitmap of the main file that fails verification, or whose CommitID is newer than the superblock's, was overwritten by an interrupted checkpoint: every page of its group free in T is scrubbed.
+2. It writes those pages in PageID order, never at or above the `pageCount` of T, and syncs the main file.
+3. It writes the superblock copy with the older generation: generation + 1, the State of T, `checkpoint_lsn` the LSN of the COMMIT that published T, the floor of §12.1, and each identifier high-watermark at least the previous superblock's, T's and that of every reservation at or below `checkpoint_lsn` (recovery skips those records). It syncs the main file.
+4. It removes the segments below the new floor that no snapshot still reads, and syncs the log directory.
+
+A crash before step 3 keeps the previous superblock and every segment from its floor; pages already written are read from the log until a checkpoint completes. A crash after it leaves segments below the floor, which the next open removes once recovery is done. A checkpoint can be repeated any number of times.
 
