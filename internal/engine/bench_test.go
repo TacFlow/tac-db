@@ -276,7 +276,7 @@ func BenchmarkMaintenance(b *testing.B) {
 		}
 		close(stop)
 		wg.Wait()
-		if active && b.N >= 200 && db.Stats().Checkpoints == 0 { // the first run of a benchmark has b.N = 1
+		if active && b.N >= 4000 && db.Stats().Checkpoints == 0 { // 64 MiB of log take about 2000 commits
 			b.Fatal("no checkpoint ran")
 		}
 		return p99(reads), p99(commits)
