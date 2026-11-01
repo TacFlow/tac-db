@@ -6,6 +6,7 @@ package engine
 
 import (
 	"math"
+	"strconv"
 	"time"
 
 	"github.com/TacFlow/tacdb/internal/errs"
@@ -45,6 +46,18 @@ const (
 // Unlimited is the MaxReadTxAge that never revokes by age; it must be set
 // explicitly.
 const Unlimited time.Duration = math.MaxInt64
+
+func (d Durability) String() string {
+	switch d {
+	case GroupSync:
+		return "GroupSync"
+	case Sync:
+		return "Sync"
+	case Async:
+		return "Async"
+	}
+	return "Durability(" + strconv.Itoa(int(d)) + ")"
+}
 
 // Options configure a handle. Start from DefaultOptions: a zero
 // BusyTimeout, for example, means fail at once, as SPEC §10.2 says.
