@@ -296,6 +296,9 @@ func (v *View) SetPageCount(n uint64) {
 	}
 }
 
+// Dirty returns the number of pages with a private copy.
+func (v *View) Dirty() int { return v.pages.Len() }
+
 // FreePageCount returns free_page_count.
 func (v *View) FreePageCount() uint64 { return v.state.FreePageCount }
 
