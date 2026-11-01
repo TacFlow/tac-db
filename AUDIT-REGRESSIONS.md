@@ -19,20 +19,20 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | AUD-13 | Vector inserts dropped from 180/s to 127/s between 5k and 20k | wave 2/3 | pending | — |
 | AUD-14 | >~2500 unique terms send update/delete to a global scan; warning only on stderr | wave 1/3 | pending | — |
 | REV-01 | A quiescent checkpoint never runs under continuous reads; the WAL hits its cap and writes fail; read replicas stop applying | M2 | done | M2d: passive checkpoint up to the oldest snapshot in `internal/engine`, segments removed below the floor (OPS-04: `TestCheckpointUnderLoad`; REC-04: `TestCheckpointCrashPoints`, `TestCheckpointFloorMidSegment`); REC-10 in M2a |
-| REV-02 | Checkpoint blocked new Begins while copying and syncing | M2 | partial | M2d: the checkpoint takes no admission lock and runs beside readers and writers (`TestCheckpointUnderLoad`, `TestCheckpointConcurrentReaders`); gate 10 of §26.2 measured in M2e |
+| REV-02 | Checkpoint blocked new Begins while copying and syncing | M2 | partial | M2d: the checkpoint takes no admission lock and runs beside readers and writers (`TestCheckpointUnderLoad`, `TestCheckpointConcurrentReaders`); M2e: gate 10 measured by `BenchmarkMaintenance` in the gates job. Reads meet it (p99 ratio 0.95 on the development machine, macOS); commits do not yet (p99 ratio 1.2 to 2.0): the Sync of the main file during a checkpoint delays the log Syncs that overlap it. Lower I/O priority for maintenance is open |
 | REV-03 | Backup and Serialize blocked the database for the whole copy | M9 | pending | — |
 | REV-04 | A Raft snapshot paused apply; on the leader it froze receipts | M11 | pending | — |
 | REV-05 | A forgotten snapshot pinned WAL and memory indefinitely | M2 | done | M2d: `MaxReadTxAge` with cooperative revocation and both pressure policies, with diagnostic events (OPS-05: `TestReadTxAge`, `TestCooperativeRevocation`, `TestPressureExpireOldest`, `TestPressureRejectWrites`) |
-| REV-06 | Hot pages were re-emitted by every intent of a group | M2 | pending | — |
-| REV-07 | A fixed 2 ms window penalized an isolated commit | M2 | pending | — |
-| REV-08 | One dedicated Sync for every 1024 IDs | M2 | pending | — |
-| REV-09 | SHA-256 over every image in the serial coordinator | M2 | pending | — |
+| REV-06 | Hot pages were re-emitted by every intent of a group | M2 | done | M2c: the coordinator appends one PAGE per PageID with the final version of the group (TX-11: `TestGroupCommit` scans the log; TX-16: `TestGroupCrash`) |
+| REV-07 | A fixed 2 ms window penalized an isolated commit | M2 | done | M2c: adaptive GroupSync with no window, one Sync per isolated commit (TX-17: `TestIsolatedWriter`); M2e: gate 12 reported by `BenchmarkIsolatedCommit` in the gates job (129 µs over the Sync on the development machine) |
+| REV-08 | One dedicated Sync for every 1024 IDs | M2 | done | M2c: adaptive blocks reserved at half of the current one, durable with the next group (TX-18: `TestIdentifiers`); M2d: watermarks across checkpoints and crashes (`TestWatermarksAcrossCheckpoints`, `TestWatermarkOfEarlierReservation`) |
+| REV-09 | SHA-256 over every image in the serial coordinator | M2 | done | M2a: the manifest digest covers PageID and CRC, not images (`wal.Manifest`); M2c: PAGE records appended equal the distinct final pages of the group (gate 3 count: `TestGroupCommit`). The CPU target of gate 3 is a design target, not measured |
 | REV-10 | FTS touched hundreds of pages per document | M5 | pending | — |
 | REV-11 | Fuzzy and prefix search without an expansion limit | M5 | pending | — |
 | REV-12 | Ranking with LIMIT scored every match | M5 | pending | — |
 | REV-13 | Vectors in overflow and a seek per distance | M8 | pending | — |
-| REV-14 | No global memory budget | M1 | partial | M1d: `internal/govern` with floors, shared pool, bounded wait and `RESOURCE_LIMIT` details; the page cache (a quota of 16 pages per handle) and value decoding debit it; GOV-01 in M2 |
-| REV-15 | The single writer held by long operations | M2/M10 | pending | — |
+| REV-14 | No global memory budget | M1 | partial | M1d: `internal/govern` with floors, shared pool, bounded wait and `RESOURCE_LIMIT` details; the page cache (a quota of 16 pages per handle) and value decoding debit it; M2c: overlays and sealed commits debit it; M2e: GOV-01 partial gate, 1024 transactions open at once over four handles fill the governor to its limit with their caches, and the live heap stays within the limit plus 10% (`TestGOV01`); refusals with details arrive with the execution memory of queries; the resident set follows GOGC without GOMEMLIMIT and is reported, not gated; the full GOV-01 with queries in M4 |
+| REV-15 | The single writer held by long operations | M2/M10 | partial | M2c: `MaxWriteTxDuration` rolls back a write transaction held too long, the queue moves on and sealed intents stay (TX-19: `TestWriteTxTimeout`); the idle remote transaction in M10 |
 | REV-16 | DDL could not index a large database online | M3 | pending | — |
 | REV-17 | A consumer wrote one WriteTx per skipped event | M7 | pending | — |
 | REV-18 | Metadata and properties in distant regions of the tree | M3 | pending | — |
@@ -42,15 +42,15 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | REV-22 | Long strings lost range and prefix scans in the index | M3 | pending | — |
 | REV-23 | MERGE without an index cost O(N) per call | M3/M7 | pending | — |
 | REV-24 | Plan cache polluted by literals | M4 | pending | — |
-| REV-25 | A per-statement savepoint could copy the overlay | M2 | pending | — |
-| REV-26 | Contention on the RWMutex, the snapshot registry and global LRUs | M2 | partial | M1d: CLOCK with second chance in shards for the page cache; M2c: heads behind atomic pointers and a registry in 16 shards, so Begin and the end of a read take no global lock; the concurrency benchmark in M2e |
+| REV-25 | A per-statement savepoint could copy the overlay | M2 | done | M2b: persistent overlay with O(1) savepoints (TX-20: `TestStatementSavepoints`, `TestRollbackTo`); M2c: statements of a transaction (`TestRollbackAndStatements`) |
+| REV-26 | Contention on the RWMutex, the snapshot registry and global LRUs | M2 | done | M1d: CLOCK with second chance in shards for the page cache; M2c: heads behind atomic pointers and a registry in 16 shards, so Begin and the end of a read take no global lock; M2e: `BenchmarkConcurrency`, the concurrency row of §26.1, runs in the gates job |
 | REV-27 | The catalog mixed declarations and hot counters; ambiguous schemaEpoch | M3 | pending | — |
 | REV-28 | A cluster receipt required two fsyncs in series | M11 | pending | — |
 | REV-29 | Bundles of up to 65 MiB went through Raft | M11 | pending | — |
 | REV-30 | One ReadIndex round per read | M12 | pending | — |
 | REV-31 | Deduplication retained whole replicated results | M12 | pending | — |
 | REV-32 | A heavy typed JSON protocol for vectors and large results | M10 | pending | — |
-| REV-33 | Recovery verified the whole database | M2 | pending | — |
+| REV-33 | Recovery verified the whole database | M2 | done | M2c: recovery verifies only the pages of the log; M2e: REC-11 gate, the open with a log of 1 GiB takes the same time over databases of 1 GiB and 100 GiB (`TestREC11`, ratio 1.04 on the development machine) |
 | REV-34 | Float results could differ across platforms | M4/M8 | pending | — |
 | REV-35 | Client authentication undefined | M10 | pending | — |
 | REV-36 | Authorization without a defined model | M10 | pending | — |
@@ -88,4 +88,4 @@ Every item of tables §32.1, §32.4 and §32.5 of the specification, with the mi
 | R13-20 | A superblock copy from a future revision could be classified as damaged and silently reopen the older copy | M1 | done | M1c: `Classify` and `ChooseSuperblock` (`TestClassify`, `TestChooseSuperblock`) |
 | R13-21 | Windows permissions without an owner check, macOS extended ACLs ignored, Windows junctions outside the symlink rule, path-based checks and inheritable ACEs ignored | M1 | partial | M1b: `internal/vfs`; green on Linux, macOS and Windows (CI run 41250873068), but the junction case skips when `mklink /J` fails; the CI now fails on that skip, and the next run closes it (SEC-08) |
 | R13-22 | Write cursors survived a savepoint restore, and a counter restored with the savepoint allowed ABA | M1/M2 | done | M1e: per-tree mutation counters and the restore counter of the transaction, both monotonic (`TestCursorInvalidation`); M2b: the overlay of `internal/versions` restores in O(1) and counts restores (`TestRollbackTo`, `TestStatementSavepoints`); M2c: transactions restore the roots of every open tree, including trees opened after the savepoint (`TestRollbackAndStatements`) |
-| R13-23 | The tail rule of §11.2 turned an ordinary power loss into CORRUPT when an unsynced append reached the disk out of order, or would drop an acknowledged commit corrupted after its Sync | M2 | partial | M2a: `durable_lsn` in BEGIN, segment roll through `spare.tmp`, new segment after a discarded tail, evidence-based tail classification (`TestTornTailIsDiscarded`, `TestCorruptionAfterSync`, `TestDiscardedTailDoesNotResurrect`); the crash matrix in M2e |
+| R13-23 | The tail rule of §11.2 turned an ordinary power loss into CORRUPT when an unsynced append reached the disk out of order, or would drop an acknowledged commit corrupted after its Sync | M2 | done | M2a: `durable_lsn` in BEGIN, segment roll through `spare.tmp`, new segment after a discarded tail, evidence-based tail classification (`TestTornTailIsDiscarded`, `TestCorruptionAfterSync`, `TestDiscardedTailDoesNotResurrect`); M2e: the crash matrix of §11.3 with lost, torn, reordered and truncated writes (`TestCrashMatrix`, `TestCrashTruncatedSegment`, `TestDiscardedTailStaysDiscarded`, `TestProcessDeathThenPowerLoss`) |
